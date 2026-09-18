@@ -85,6 +85,13 @@ export function withPinnedBrowserLocale(args: string[]): string[] {
 }
 
 export default () => ({
+  layout: {
+    brand: {
+      name: process.env.BRAND_NAME,
+      logoUrl: process.env.BRAND_LOGO,
+    },
+  },
+
   port: parseInt(process.env.PORT || '2785', 10),
 
   // Root of the persistent state tree (see DEFAULT_DATA_DIR). Read by PluginStorageService for the

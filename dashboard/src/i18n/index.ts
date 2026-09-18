@@ -4,6 +4,7 @@ import { initReactI18next } from 'react-i18next';
 import LanguageDetector from 'i18next-browser-languagedetector';
 
 export const supportedLanguages = [
+  'id',
   'en',
   'de',
   'es',
@@ -23,19 +24,20 @@ export type SupportedLanguage = (typeof supportedLanguages)[number];
 export const rtlLanguages: SupportedLanguage[] = ['he', 'ar'];
 
 export const languageOptions: Array<{ value: SupportedLanguage; label: string; compactLabel: string }> = [
+  { value: 'id', label: 'Indonesia', compactLabel: 'ID' },
   { value: 'en', label: 'English', compactLabel: 'EN' },
-  { value: 'de', label: 'Deutsch', compactLabel: 'DE' },
-  { value: 'tr', label: 'Türkçe', compactLabel: 'TR' },
-  { value: 'es', label: 'Español', compactLabel: 'ES' },
-  { value: 'he', label: 'עברית', compactLabel: 'עברית' },
-  { value: 'zh-CN', label: '简体中文', compactLabel: '简中' },
-  { value: 'zh-HK', label: '繁體中文', compactLabel: '繁中' },
-  { value: 'ar', label: 'العربية', compactLabel: 'AR' },
-  { value: 'te', label: 'తెలుగు', compactLabel: 'TE' },
-  { value: 'fr', label: 'Français', compactLabel: 'FR' },
-  { value: 'it', label: 'Italiano', compactLabel: 'IT' },
-  { value: 'pt-BR', label: 'Português (Brasil)', compactLabel: 'PT' },
-  { value: 'ko', label: '한국어', compactLabel: 'KO' },
+  // { value: 'de', label: 'Deutsch', compactLabel: 'DE' },
+  // { value: 'tr', label: 'Türkçe', compactLabel: 'TR' },
+  // { value: 'es', label: 'Español', compactLabel: 'ES' },
+  // { value: 'he', label: 'עברית', compactLabel: 'עברית' },
+  // { value: 'zh-CN', label: '简体中文', compactLabel: '简中' },
+  // { value: 'zh-HK', label: '繁體中文', compactLabel: '繁中' },
+  // { value: 'ar', label: 'العربية', compactLabel: 'AR' },
+  // { value: 'te', label: 'తెలుగు', compactLabel: 'TE' },
+  // { value: 'fr', label: 'Français', compactLabel: 'FR' },
+  // { value: 'it', label: 'Italiano', compactLabel: 'IT' },
+  // { value: 'pt-BR', label: 'Português (Brasil)', compactLabel: 'PT' },
+  // { value: 'ko', label: '한국어', compactLabel: 'KO' },
 ];
 
 export function resolveSupportedLanguage(lang?: string): SupportedLanguage {

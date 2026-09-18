@@ -29,11 +29,7 @@ import type { BaileysSessionStore } from './baileys-session-store';
 
 /** Linked-device identity shown in WhatsApp (Settings → Linked Devices). The display name is
  * operator-brandable via BAILEYS_BROWSER_NAME; it only applies to pairings made after the change. */
-const BAILEYS_BROWSER: [string, string, string] = [
-  process.env.BAILEYS_BROWSER_NAME?.trim() || 'OpenWA',
-  'Chrome',
-  '120.0.0',
-];
+const BAILEYS_BROWSER: [string, string, string] = [process.env.BAILEYS_BROWSER_NAME?.trim() || '', 'Chrome', '120.0.0'];
 
 /**
  * How long logout() waits for WhatsApp to acknowledge the `remove-companion-device` IQ. Completion of

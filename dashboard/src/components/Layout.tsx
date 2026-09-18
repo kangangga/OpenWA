@@ -25,13 +25,15 @@ import {
 import { useTheme } from '../hooks/useTheme';
 import { type UserRole } from '../hooks/useRole';
 import { languageOptions, resolveSupportedLanguage, rtlLanguages, type SupportedLanguage } from '../i18n';
-import { healthApi } from '../services/api';
+import { healthApi, infraApi } from '../services/api';
 import './Layout.css';
+import { useInfraLayout } from '../hooks/useInfraLayout';
 
 interface LayoutProps {
   onLogout: () => void;
   userRole: UserRole | null;
 }
+
 
 const allNavItems = [
   { to: '/', icon: LayoutDashboard, key: 'dashboard' as const, adminOnly: false },
@@ -55,6 +57,9 @@ export function Layout({ onLogout, userRole }: LayoutProps) {
   const { theme, setTheme, resolvedTheme } = useTheme();
   const ThemeIcon = themeIcons[theme];
   const themeLabel = t(`theme.${theme}`);
+  const layout = useInfraLayout();
+  console.log("🚀 ~ Layout ~ sessionConfig:", layout)
+
 
   const navItems = allNavItems.filter(item => !item.adminOnly || userRole === 'admin');
 
@@ -142,8 +147,8 @@ export function Layout({ onLogout, userRole }: LayoutProps) {
             {isMobileOpen ? <X size={24} /> : <Menu size={24} />}
           </button>
           <div className="mobile-brand">
-            <img src="/openwa_logo.webp" alt="OpenWA" className="sidebar-logo" />
-            <span className="brand-name">{t('common.appName')}</span>
+            <img src={layout?.brand.logoUrl} alt={layout?.brand.name} className="sidebar-logo" />
+            <span className="brand-name">{layout?.brand.name}</span>
           </div>
           <div style={{ width: 40 }} />
         </header>
@@ -155,10 +160,10 @@ export function Layout({ onLogout, userRole }: LayoutProps) {
         className={`sidebar ${isCollapsed ? 'collapsed' : ''} ${isMobile ? 'mobile' : ''} ${isMobileOpen ? 'open' : ''}`}
       >
         <div className="sidebar-header">
-          <img src="/openwa_logo.webp" alt="OpenWA" className="sidebar-logo" />
+          <img src={layout?.brand.logoUrl} alt={layout?.brand.name} className="sidebar-logo" />
           {!isCollapsed && (
             <div className="sidebar-brand">
-              <span className="brand-name">{t('common.appName')}</span>
+              <span className="brand-name">{layout?.brand.name}</span>
               <span className="brand-version">v{version}</span>
             </div>
           )}

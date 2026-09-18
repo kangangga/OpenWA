@@ -7,6 +7,7 @@ import { InfraStorageController } from './infra-storage.controller';
 import { EngineModule } from '../../engine/engine.module';
 import { DockerModule } from '../docker';
 import { SessionModule } from '../session/session.module';
+import { InfraLayoutController } from './infra-layout.controller';
 
 // Only import QueueModule if explicitly enabled to avoid Redis connection errors. It registers and
 // exports the webhook queue, which InfraStatusController injects (@Optional) to report live job counts.
@@ -21,7 +22,13 @@ if (process.env.QUEUE_ENABLED === 'true') {
   // SessionModule gives InfraDataService the live-engine registry for the import pre-flight
   // orphan check. Its own imports (WebhookModule, StatusStoreModule) never point back here — no cycle.
   imports: [EngineModule, DockerModule, SessionModule, ...queueModules],
-  controllers: [InfraStatusController, InfraConfigController, InfraDataController, InfraStorageController],
+  controllers: [
+    InfraStatusController,
+    InfraConfigController,
+    InfraDataController,
+    InfraStorageController,
+    InfraLayoutController,
+  ],
   providers: [InfraDataService],
 })
 export class InfraModule {}

@@ -935,6 +935,13 @@ export interface ProfilePictureResponse {
   url: string | null;
 }
 
+export interface InfraLayout {
+  brand: {
+    name: string;
+    logoUrl: string;
+  };
+}
+
 export const contactApi = {
   list: (sessionId: string) => request<Contact[]>(`/sessions/${sessionId}/contacts`),
   checkNumber: (sessionId: string, number: string) =>
@@ -1111,6 +1118,7 @@ export const healthApi = {
 };
 
 export const infraApi = {
+  getLayout: () => request<InfraLayout>('/infra/layout'),
   getStatus: () => request<InfraStatus>('/infra/status'),
   getConfig: () => request<SavedConfig>('/infra/config'),
   saveConfig: (config: SaveConfigPayload) =>

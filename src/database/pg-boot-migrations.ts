@@ -98,7 +98,6 @@ export async function createBootDataSource(
 function lockClientConfig(options: PostgresOptions): ClientConfig {
   const extra = (options.extra ?? {}) as { connectionTimeoutMillis?: number };
   return {
-    url: options.url,
     host: options.host,
     port: options.port,
     user: options.username,

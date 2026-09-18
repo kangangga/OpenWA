@@ -186,15 +186,12 @@ if (dashboardServingEnabled && dashboardBuildPresent) {
           // search_path, so without this raw DDL would land in `public` while the migration ledger
           // lands in the configured schema.
           const schema = configService.get<string>('dataDatabase.schema', 'public');
-          const dbUrl = configService.get<string>('dataDatabase.url');
-          console.log('🚀 ~ dbUrl:', dbUrl);
           const useCustomSearchPath = schema && schema !== 'public';
           return {
             ...baseConfig,
             name: 'data',
             type: 'postgres' as const,
             schema,
-            url: configService.get<string>('dataDatabase.url'),
             host: configService.get<string>('dataDatabase.host'),
             port: configService.get<number>('dataDatabase.port'),
             username: configService.get<string>('dataDatabase.username'),

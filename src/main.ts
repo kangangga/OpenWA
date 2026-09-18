@@ -71,6 +71,7 @@ async function bootstrap() {
     databaseType: process.env.DATABASE_TYPE,
     databasePassword: process.env.DATABASE_PASSWORD,
     postgresBuiltIn: process.env.POSTGRES_BUILTIN,
+    databaseUrl: process.env.DATABASE_URL,
     databaseHost: process.env.DATABASE_HOST,
     storageType: process.env.STORAGE_TYPE,
     minioBuiltIn: process.env.MINIO_BUILTIN,

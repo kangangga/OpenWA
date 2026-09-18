@@ -58,6 +58,28 @@ export function validateEnv(config: EnvConfig): EnvConfig {
     return typeof value === 'string' && value.trim() !== '' ? value.trim() : undefined;
   };
 
+  const isValidDatabaseUrl = (url: string): boolean => {
+    try {
+      if (url.startsWith('sqlite:')) return true;
+
+      const protocol = new URL(url).protocol;
+
+      return [
+        'postgres:',
+        'postgresql:',
+        'mysql:',
+        'mariadb:',
+        'mongodb:',
+        'mongodb+srv:',
+        'redis:',
+        'rediss:',
+      ].includes(protocol);
+    } catch {
+      return false;
+    }
+  };
+
+  const dbUrl = str('DATABASE_URL');
   const dbType = str('DATABASE_TYPE');
   if (dbType && dbType !== 'sqlite' && dbType !== 'postgres') {
     errors.push(`DATABASE_TYPE must be "sqlite" or "postgres" (got "${dbType}")`);
@@ -95,10 +117,14 @@ export function validateEnv(config: EnvConfig): EnvConfig {
   }
 
   if (dbType === 'postgres') {
-    for (const key of ['DATABASE_HOST', 'DATABASE_USERNAME', 'DATABASE_PASSWORD']) {
-      if (!str(key)) {
-        errors.push(`${key} is required when DATABASE_TYPE=postgres`);
+    if (!dbUrl) {
+      for (const key of ['DATABASE_HOST', 'DATABASE_USERNAME', 'DATABASE_PASSWORD']) {
+        if (!str(key)) {
+          errors.push(`${key} is required when DATABASE_TYPE=postgres`);
+        }
       }
+    } else if (!isValidDatabaseUrl(dbUrl)) {
+      errors.push('Invalid database URL. Please check DATABASE_URL.');
     }
     // The Postgres data connection always runs migrations (app.module.ts hardcodes migrationsRun=true).
     // An opted-in DATABASE_SYNCHRONIZE=true makes TypeORM re-sync the schema from entities on every

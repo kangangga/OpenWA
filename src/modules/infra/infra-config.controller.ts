@@ -314,6 +314,7 @@ export class InfraConfigController {
         databaseType: bootValue('DATABASE_TYPE'),
         databasePassword: bootValue('DATABASE_PASSWORD'),
         postgresBuiltIn: bootValue('POSTGRES_BUILTIN'),
+        databaseUrl: bootValue('DATABASE_URL'),
         databaseHost: bootValue('DATABASE_HOST'),
         storageType: bootValue('STORAGE_TYPE'),
         s3AccessKey: bootValue('S3_ACCESS_KEY_ID'),

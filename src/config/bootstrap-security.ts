@@ -165,6 +165,7 @@ export interface SecretCheckEnv {
   postgresBuiltIn?: string;
   /** DATABASE_HOST — used to confirm a built-in exemption really points at the internal `postgres`. */
   databaseHost?: string;
+  databaseUrl?: string;
   storageType?: string;
   s3AccessKey?: string;
   s3SecretKey?: string;
@@ -214,8 +215,9 @@ export function assertNoDefaultSecretsInProduction(env: SecretCheckEnv): void {
   // flag AND an internal host: a host-pinned EXTERNAL datastore (even with the built-in flag set) is
   // reachable, so its weak credential is still enforced.
   const dbHost = env.databaseHost?.trim();
+  const dbUrl = env.databaseUrl?.trim();
   const dbExempt = env.postgresBuiltIn === 'true' && (!dbHost || dbHost === 'postgres');
-  if (env.databaseType === 'postgres' && !dbExempt && isWeak(env.databasePassword)) {
+  if (env.databaseType === 'postgres' && !dbExempt && isWeak(env.databasePassword) && !dbUrl) {
     problems.push('DATABASE_PASSWORD');
   }
   const s3Exempt = env.minioBuiltIn === 'true' && isInternalS3Endpoint(env.s3Endpoint);

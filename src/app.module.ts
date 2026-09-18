@@ -192,6 +192,7 @@ if (dashboardServingEnabled && dashboardBuildPresent) {
             name: 'data',
             type: 'postgres' as const,
             schema,
+            url: configService.get<string>('dataDatabase.url'),
             host: configService.get<string>('dataDatabase.host'),
             port: configService.get<number>('dataDatabase.port'),
             username: configService.get<string>('dataDatabase.username'),

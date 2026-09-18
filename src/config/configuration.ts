@@ -192,6 +192,7 @@ export default () => ({
     // migration time rather than silently falling back to public. SQLite ignores this.
     schema: process.env.POSTGRES_SCHEMA || 'public',
     // PostgreSQL/MySQL connection (used when type is postgres/mysql)
+    url: process.env.DATABASE_URL,
     host: process.env.DATABASE_HOST || 'localhost',
     port: parseInt(process.env.DATABASE_PORT || '5432', 10),
     username: process.env.DATABASE_USERNAME,

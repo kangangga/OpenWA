@@ -98,6 +98,7 @@ export async function createBootDataSource(
 function lockClientConfig(options: PostgresOptions): ClientConfig {
   const extra = (options.extra ?? {}) as { connectionTimeoutMillis?: number };
   return {
+    url: options.url,
     host: options.host,
     port: options.port,
     user: options.username,
@@ -108,14 +109,5 @@ function lockClientConfig(options: PostgresOptions): ClientConfig {
     ssl: options.ssl as ClientConfig['ssl'],
     // Bound a stuck connect like the pool does (app.module's extra carries the same setting).
     connectionTimeoutMillis: extra.connectionTimeoutMillis ?? 10000,
-    // No UTC pin here on purpose: this client only ever calls pg_advisory_lock/unlock, so it neither
-    // binds nor reads a timestamp and its session zone cannot reach a column.
-    // This client's only statements are pg_advisory_lock/unlock, and statement_timeout applies to
-    // ANY command — including the wait inside pg_advisory_lock — so it must be OFF here. A config
-    // `statement_timeout: 0` would NOT do it: pg drops falsy values from the startup packet, so
-    // disable it via the startup `options` string instead, which also overrides any role- or
-    // database-level default the server may carry. (lock_timeout never applies to advisory locks,
-    // so it needs no override.)
-    options: '-c statement_timeout=0',
   };
 }

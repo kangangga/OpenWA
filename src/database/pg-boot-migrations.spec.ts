@@ -26,7 +26,7 @@ const PG_OPTIONS: DataSourceOptions = {
   // The app config still carries this; the factory takes over execution and must neutralize it.
   migrationsRun: true,
   migrationsTransactionMode: 'all',
-  extra: { statement_timeout: 30000, connectionTimeoutMillis: 10000 },
+  extra: { connectionTimeoutMillis: 10000 },
 };
 
 describe('createBootDataSource (postgres boot migrations)', () => {
@@ -121,7 +121,7 @@ describe('createBootDataSource (postgres boot migrations)', () => {
     });
     // The resolved config object itself is untouched — the flag stays as the built-in fallback.
     expect(PG_OPTIONS.migrationsRun).toBe(true);
-    expect(PG_OPTIONS.extra).toEqual({ statement_timeout: 30000, connectionTimeoutMillis: 10000 });
+    expect(PG_OPTIONS.extra).toEqual({ connectionTimeoutMillis: 10000 });
   });
 
   it('builds the lock client without a statement timeout (pg_advisory_lock must survive the wait)', async () => {

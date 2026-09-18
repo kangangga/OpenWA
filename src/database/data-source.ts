@@ -70,6 +70,7 @@ export function buildPostgresDataSourceOptions(env: NodeJS.ProcessEnv = process.
     schema,
     host: env.DATABASE_HOST || 'localhost',
     port: parseInt(env.DATABASE_PORT || '5432', 10),
+    url: env.DATABASE_URL,
     username: env.DATABASE_USERNAME,
     password: env.DATABASE_PASSWORD,
     database: env.DATABASE_NAME || 'openwa',

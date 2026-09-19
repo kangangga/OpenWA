@@ -4,8 +4,8 @@ module.exports = {
       name: 'openwa',
       script: 'dist/main.js',
       cwd: './',
-      instances: 'max', // Use all available CPUs
-      exec_mode: 'cluster', // Enable clustering for better performance
+      instances: '1', // Use all available CPUs
+      exec_mode: 'fork', // Enable clustering for better performance
       autorestart: true,
       watch: false,
       max_memory_restart: '2G',

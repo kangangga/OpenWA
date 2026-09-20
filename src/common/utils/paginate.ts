@@ -5,6 +5,7 @@ export const DEFAULT_LIST_LIMIT = 1000;
 export interface ListOptions {
   limit?: number;
   offset?: number;
+  branch_id?: string;
 }
 
 /** Normalize a query/list window for both in-memory slicing and database skip/take. */

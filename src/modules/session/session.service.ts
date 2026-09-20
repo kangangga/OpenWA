@@ -337,7 +337,13 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
       order: { createdAt: 'DESC', id: 'DESC' },
       take: limit,
       skip: offset,
+      where: opts.branch_id
+        ? {
+            branch_id: opts.branch_id,
+          }
+        : undefined,
     };
+
     const where: FindOptionsWhere<Session> = {};
     if (allowedSessions && allowedSessions.length > 0) {
       where.id = In(allowedSessions);

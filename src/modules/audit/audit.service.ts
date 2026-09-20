@@ -12,6 +12,7 @@ export const MAX_AUDIT_PAGE_SIZE = 200;
 
 interface AuditContext {
   apiKey?: ApiKey;
+  branchId?: string;
   sessionId?: string;
   sessionName?: string;
   ipAddress?: string;

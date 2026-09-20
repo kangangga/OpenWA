@@ -71,10 +71,21 @@ function planSteps(root, env = process.env) {
   const cleanEnv = sanitizeEnv(env);
   const steps = [];
   if (fs.existsSync(path.join(root, 'dashboard'))) {
+    // steps.push({
+    //   name: 'dashboard dependencies (npm ci)',
+    //   command: 'npm ci',
+    //   options: { stdio: 'inherit', shell: true, cwd: path.join(root, 'dashboard'), env: cleanEnv },
+    // });
+
     steps.push({
-      name: 'dashboard dependencies (npm ci)',
-      command: 'npm ci',
-      options: { stdio: 'inherit', shell: true, cwd: path.join(root, 'dashboard'), env: cleanEnv },
+      name: 'dashboard dependencies (bun install)',
+      command: 'bun install',
+      options: {
+        stdio: 'inherit',
+        shell: true,
+        cwd: path.join(root, 'dashboard'),
+        env: cleanEnv,
+      },
     });
   }
   const patcher = path.join(root, 'scripts', 'patch-wwebjs-201832.js');

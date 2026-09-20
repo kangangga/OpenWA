@@ -68,4 +68,7 @@ export class CreateSessionDto {
   @IsOptional()
   @IsIn(['http', 'https', 'socks4', 'socks5'])
   proxyType?: 'http' | 'https' | 'socks4' | 'socks5';
+
+  @IsOptional()
+  branch_id?: string | number;
 }

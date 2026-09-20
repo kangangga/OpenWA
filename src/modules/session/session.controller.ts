@@ -86,6 +86,7 @@ export class SessionController {
     const session = await this.sessionService.create(dto);
     await this.auditService.logInfo(AuditAction.SESSION_CREATED, {
       sessionId: session.id,
+      branchId: session.branch_id,
       sessionName: session.name,
     });
     return this.transformSession(session);
@@ -100,6 +101,7 @@ export class SessionController {
   })
   @ApiQuery({ name: 'limit', required: false, description: 'Max sessions to return (1-1000, default 1000)' })
   @ApiQuery({ name: 'offset', required: false, description: 'Number of sessions to skip (for paging)' })
+  @ApiQuery({ name: 'branch_id', required: false, description: 'Branch sessions' })
   @ApiQuery({
     name: 'name',
     required: false,
@@ -112,6 +114,7 @@ export class SessionController {
     @CurrentApiKey() apiKey?: ApiKey,
     @Query('limit') limit?: string,
     @Query('offset') offset?: string,
+    @Query('branch_id') branch_id?: string,
     @Query('name') name?: string | string[],
   ): Promise<SessionResponseDto[]> {
     // ?name=a&name=b arrives as an array and ?name= as ''; neither names one session, and silently
@@ -124,8 +127,10 @@ export class SessionController {
     const sessions = await this.sessionService.findAll(apiKey?.allowedSessions, {
       limit: limit ? parseInt(limit, 10) : undefined,
       offset: offset ? parseInt(offset, 10) : undefined,
+      branch_id: branch_id,
       name,
     });
+
     return sessions.map(s => this.transformSession(s));
   }
 
@@ -816,6 +821,7 @@ export class SessionController {
   }
 
   @Get('stats/overview')
+  @ApiQuery({ name: 'branch_id', required: false, description: 'Branch sessions' })
   @ApiOperation({
     summary: 'Get session statistics for multi-session monitoring',
   })

@@ -284,7 +284,12 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
   async create(dto: CreateSessionDto): Promise<Session> {
     // Check if session with same name exists
     const existing = await this.sessionRepository.findOne({
-      where: { name: dto.name },
+      where: {
+        name: dto.name,
+        ...(dto.branch_id !== undefined && {
+          branch_id: dto.branch_id as string,
+        }),
+      },
     });
 
     if (existing) {
@@ -337,17 +342,17 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
       order: { createdAt: 'DESC', id: 'DESC' },
       take: limit,
       skip: offset,
-      where: opts.branch_id
-        ? {
-            branch_id: opts.branch_id,
-          }
-        : undefined,
     };
 
     const where: FindOptionsWhere<Session> = {};
     if (allowedSessions && allowedSessions.length > 0) {
       where.id = In(allowedSessions);
     }
+
+    if (opts.branch_id) {
+      where.branch_id = Array.isArray(opts.branch_id) ? In(opts.branch_id) : In([opts.branch_id]);
+    }
+
     // Exact, case-sensitive match. Only a non-empty string reaches TypeORM: anything else (an
     // array from a repeated query key, an empty value) is not a name and must not become one.
     if (typeof opts.name === 'string' && opts.name.length > 0) {

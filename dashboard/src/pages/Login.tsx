@@ -62,7 +62,6 @@ export function Login({ onLogin }: LoginProps) {
       <div className="login-card">
         <div className="login-logo">
           <img src={layout?.brand.logoUrl} alt={layout?.brand.name} className="logo-icon" />
-          <span className="version-info">{layout?.brand.name} </span>
         </div>
 
         <div className="login-language">

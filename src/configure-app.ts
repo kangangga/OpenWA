@@ -180,9 +180,14 @@ export function configureApp(app: INestApplication, options: ConfigureAppOptions
       if (!documentRequest) return next();
 
       res.setHeader('Cache-Control', 'no-store');
+      const html = dashboardIndex
+        .replaceAll(
+          '__FAVICON__',
+          `<link rel="icon" type="image/*" href="${configService.get<string>('layout.brand.iconUrl') ?? ''}" />`,
+        )
+        .replaceAll('__TITLE__', configService.get<string>('layout.brand.name') ?? '');
 
-      dashboardIndex.split('__TITLE__').join(configService.get('layout.brand.name'));
-      res.type('html').send(injectDashboardCspNonce(dashboardIndex, res.locals.cspNonce as string));
+      res.type('html').send(injectDashboardCspNonce(html, res.locals.cspNonce as string));
     });
   }
 

@@ -58,9 +58,6 @@ export function Layout({ onLogout, userRole }: LayoutProps) {
   const ThemeIcon = themeIcons[theme];
   const themeLabel = t(`theme.${theme}`);
   const layout = useInfraLayout();
-  console.log("🚀 ~ Layout ~ sessionConfig:", layout)
-
-
   const navItems = allNavItems.filter(item => !item.adminOnly || userRole === 'admin');
 
   const [isCollapsed, setIsCollapsed] = useState(false);

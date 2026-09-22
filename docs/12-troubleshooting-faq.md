@@ -280,7 +280,8 @@ change will come from the engine libraries implementing the step.
 
 **Cause:** the pairing request carries the linked-device identity, and some accounts reject a
 non-standard one. The default device name is `OpenWA`; set `BAILEYS_BROWSER_NAME=Ubuntu` (or another
-standard OS name), restart the session, and request a fresh code. The name applies to new pairings only;
+standard OS name), restart OpenWA itself (the name is read at boot, so stopping and starting the session
+is not enough), and request a fresh code. The name applies to new pairings only;
 a session that is already linked keeps the name it was paired with until it is re-linked. See the
 phone-number pairing example in `docs/examples/session-phone-number-pairing.md`.
 
@@ -342,12 +343,30 @@ WWEBJS_WEB_VERSION=<a build from that registry's html/ folder>
 
 Restart the container after changing it. Pick the build from
 [wppconnect-team/wa-version](https://github.com/wppconnect-team/wa-version) (the `html/` folder) — a
-build the registry no longer serves is fetched, missed, and silently ignored, leaving you on the
-default behaviour rather than the pin you asked for. With
+build the registry no longer serves is fetched, missed, and ignored, leaving you on the default
+behaviour rather than the pin you asked for (the `ready`-time warning below names both builds). With
 `WWEBJS_WEB_VERSION` unset, `latest`, or `auto` (the default), OpenWA auto-resolves a settled build
 from that registry and pins its HTML — note this HTML is fetched from a third-party repository and
 executed inside the `web.whatsapp.com` origin without an integrity check. Set
-`WWEBJS_WEB_VERSION=off` to disable pinning and use the first-party build served by WhatsApp.
+`WWEBJS_WEB_VERSION=off` to disable pinning and use the first-party build served by WhatsApp. An
+unpinned session (this setting, or an auto-resolve that could not reach the registry) caches nothing to
+disk, so it also works on the image's read-only root filesystem.
+
+A pin is not guaranteed to hold. whatsapp-web.js applies it by answering the page's document request
+with the pinned HTML, and that can miss in two ways: a pin whose HTML could not be fetched is dropped
+and the live build loads, and WhatsApp Web's service worker can serve its own cached build without the
+request reaching whatsapp-web.js. Either way the page can run a different build than the one
+requested, while the startup line `Pinning WhatsApp Web version …` still names the requested build.
+When a session reaches `ready`, OpenWA reads the build the page reports and logs it (action
+`web_version_running`); when a pin was requested and the page runs a different build, it logs a
+warning naming both (action `web_version_pin_not_applied`). The comparison ignores the registry's
+suffix such as `-alpha`, so a pin and the same bare build count as a match.
+
+The warning changes nothing about the session. It reached `ready` on the build the warning names, so
+the pin did not cover that page load, and a session that works on that build needs no action.
+If the pin is one you set yourself, check that the registry still serves it. Whether the service worker
+answers can differ from one page load to the next, so a later restart may load the pin. When you report
+a problem with the session, include both builds.
 
 ### Issue: QR generation times out on slow first boot (WSL2 / low-resource)
 
@@ -553,20 +572,20 @@ acknowledged before the companion device is allowed to stay linked. The adapter 
 and only gives up after five clicks that fail to land — at that point a human must click through it
 once, so the session stops instead of being silently unlinked by WhatsApp about five minutes later.
 
-> **If the modal is not in English:** the detector matches the English button label (`Continue`) and
-> heading ("What's new"). The language WhatsApp Web renders in follows the browser locale, which OpenWA
-> does not set, so it is whatever the browser the container launches defaults to
-> (`PUPPETEER_EXECUTABLE_PATH` — Chrome for Testing on amd64, Debian's `chromium` on arm64). You can
-> pin it yourself by appending `--lang=en-US` to `PUPPETEER_ARGS` — that variable **replaces** the
-> default list rather than adding to it, so repeat the existing flags too (dropping `--no-sandbox` in
-> a container stops Chromium launching at all). If your deployment does get a
-> localised modal, it is **not** auto-dismissed and the session never reaches `action_required` —
-> instead it links normally, then drops to `disconnected` with reason `LOGOUT` a few minutes later and
-> the device disappears from the phone's Linked devices list. That miss is no longer silent: when the
-> watcher finds a visible dialog it cannot match, it logs a warning (`action:
-onboarding_dialog_unrecognized`) carrying the dialog's heading and button labels — the label to add
-> via `WWEBJS_ONBOARDING_CONTINUE_LABELS`, and the heading worth reporting — minutes before the unlink
-> would happen. Because that path wipes the stored
+> **If the modal is not in English:** by default the detector matches only the English button label
+> (`Continue`) under the English heading ("What's new"). OpenWA appends `--lang=en-US` to the browser
+> flags unless `PUPPETEER_ARGS` already carries a `--lang`, but that sets the browser's language, and
+> WhatsApp Web may still render in the account's own language. For another language, add the modal's
+> confirm-button label to `WWEBJS_ONBOARDING_CONTINUE_LABELS` (for example `Continuar`) and restart
+> OpenWA itself: the value is read at boot, so stopping and starting the session is not enough. A
+> configured label is clicked
+> without the English heading check, but only on a button inside a visible dialog. If your deployment gets a
+> localised modal without a matching label, it is **not** auto-dismissed and the session never reaches
+> `action_required`; instead it links normally, then drops to `disconnected` with reason `LOGOUT` a few
+> minutes later and the device disappears from the phone's Linked devices list. That miss is not
+> silent: when the watcher finds a visible dialog it cannot match, it logs a warning
+> (`action: onboarding_dialog_unrecognized`) carrying the dialog's heading and button labels, including
+> the label to add, minutes before the unlink would happen. Because that path wipes the stored
 > credentials, the automatic reconnect comes back with a fresh QR on its own, so the session is
 > usually already sitting at `qr_ready` rather than needing a manual start. Acknowledge the modal once
 > in a browser signed in as that account, then scan the QR. It does not recur — the modal is shown
@@ -729,7 +748,7 @@ rm -rf node_modules/whatsapp-web.js && npm ci
   block/unblock refusing every id, a status media send that never arrives, a group description that
   cannot be set, an app-state resync that never settles
 
-**Cause:** OpenWA applies nine exact source transforms to its engine libraries at install time
+**Cause:** OpenWA applies eleven exact source transforms to its engine libraries at install time
 (docs/29 §29.3). The Docker image runs them without `--best-effort`, so a source shape a patcher
 cannot recognise fails the image build. A source install runs them through `scripts/postinstall.js`
 with `--best-effort`, where a patcher that cannot apply prints one line into a long `npm install`
@@ -900,8 +919,8 @@ curl -X POST http://localhost:2785/api/sessions/{sessionId}/webhooks \
   }'
 ```
 
-`retryCount` (0–5, default 3) is per webhook. The delivery timings are process-wide environment
-variables:
+`retryCount` (0–5, default 3) is per webhook and counts total delivery attempts, including the first, so `1`
+retries nothing. The delivery timings are process-wide environment variables:
 
 ```bash
 WEBHOOK_TIMEOUT=10000      # per-attempt HTTP timeout in ms (default 10000)

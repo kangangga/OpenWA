@@ -6,6 +6,7 @@ import {
   ContactCard,
   DeliveryStatus,
   MediaInput,
+  MessageContact,
   MessageReaction,
   MessageResult,
   PollInput,
@@ -18,7 +19,7 @@ import { EngineRefusedError } from '../../common/errors/engine-refused.error';
 import { loadRemoteMediaBuffer } from '../../common/media/load-remote-media';
 import { chatKind, userPart } from '../identity/wa-id';
 import { chatHistoryMediaBudgetBytes, coerceDeclaredSize, ingestMediaBudgetBytes } from './inbound-media-cap';
-import { buildIncomingMessageBase } from './message-mapper';
+import { buildIncomingMessageBase, mapContactFields } from './message-mapper';
 import { buildVCard } from './vcard';
 import { EngineNotSupportedError } from '../../common/errors/engine-not-supported.error';
 import { RecipientUnreachableError } from '../../common/errors/recipient-unreachable.error';
@@ -82,8 +83,9 @@ export function isHttpUrl(value: string): boolean {
  * existing MIME-detection behavior.
  */
 export async function loadRemoteMedia(url: string, sessionProxyUrl: string | undefined): Promise<MessageMedia> {
-  // Fetch through the SSRF-pinned path: it validates the host, pins the connection to the vetted IP
-  // (so a DNS rebind can't redirect it to an internal target between check and connect), caps bytes,
+  // Fetch through the SSRF-guarded path: it validates the host, pins a direct or SOCKS connection to
+  // the vetted IP (so a DNS rebind can't redirect it to an internal target between check and connect;
+  // an HTTP/HTTPS session proxy resolves the name itself, so nothing is pinned there), caps bytes,
   // and refuses redirects. We then build the MessageMedia from the returned bytes — NOT via
   // MessageMedia.fromUrl, whose bundled node-fetch performs its own unpinned DNS re-resolution.
   // `sessionProxyUrl` routes the fetch through this session's egress proxy (#1626); the browser's
@@ -94,9 +96,10 @@ export async function loadRemoteMedia(url: string, sessionProxyUrl: string | und
 }
 
 /**
- * True when a send error is whatsapp-web.js's "recipient needs a LID we don't have" failure, raised
- * when sending to a `@c.us` for a contact WhatsApp has migrated to `@lid`.
- * Matched on the wwjs error text — there is no structured code; revisit if wwjs changes it.
+ * True when a send error is WhatsApp Web's "recipient needs a LID we don't have" failure, a bare
+ * Error its own bundle raises when sending to a `@c.us` for a contact WhatsApp has migrated to
+ * `@lid`. Matched on WhatsApp Web's error text — there is no structured code; revisit if WhatsApp
+ * Web changes it.
  */
 export function isNoLidForUserError(err: unknown): boolean {
   return err instanceof Error && err.message.includes('No LID for user');
@@ -540,6 +543,9 @@ export class WwebjsMessaging {
     try {
       // Find the message to quote
       const chat = await this.client().getChatById(chatId);
+      if (!chat) {
+        throw new MessageNotFoundError(quotedMsgId, chatId);
+      }
       const messages = await chat.fetchMessages({ limit: 100 });
       const quotedMsg = messages.find(m => m.id._serialized === quotedMsgId);
 
@@ -568,6 +574,9 @@ export class WwebjsMessaging {
     this.host.ensureReady();
     try {
       const chat = await this.client().getChatById(fromChatId);
+      if (!chat) {
+        throw new MessageNotFoundError(messageId, fromChatId);
+      }
       const messages = await chat.fetchMessages({ limit: 100 });
       const msgToForward = messages.find(m => m.id._serialized === messageId);
 
@@ -707,6 +716,10 @@ export class WwebjsMessaging {
       : mediaMaxBytes === undefined
         ? chatHistoryMediaBudgetBytes()
         : ingestMediaBudgetBytes(mediaMaxBytes);
+    // Sender contacts resolved so far, keyed like Message.getContact() (`author || from`). Each lookup
+    // is a page round trip and a history page repeats the same few senders, so resolve each once; a
+    // failed lookup is remembered as undefined rather than retried for every later message.
+    const senderContacts = new Map<string, MessageContact | undefined>();
     for (const msg of messages) {
       if (signal?.aborted) {
         break;
@@ -721,6 +734,29 @@ export class WwebjsMessaging {
       out.isGroup = chatId.endsWith('@g.us');
       out.isStatusBroadcast = chatId === 'status@broadcast';
       out.kind = chatKind(chatId);
+      // buildIncomingMessageBase only fills `contact` from the raw payload's synchronous
+      // notifyName, which is frequently absent on a history-fetched message object (unlike a
+      // freshly delivered one). Without this, a group participant not in the account's own
+      // contacts (author-only, no saved name) shows no sender label at all in the chat view,
+      // even though the live `message` event handler resolves one via getContact() for the
+      // exact same message. Mirror that here so history and live rendering agree.
+      const senderId = msg.author || msg.from;
+      if (!senderContacts.has(senderId)) {
+        let resolved: MessageContact | undefined;
+        try {
+          const contact = await msg.getContact();
+          if (contact) resolved = mapContactFields(contact, process.env.WEBHOOK_CONTACT_DETAILS === 'true');
+        } catch (error) {
+          this.host.logger.warn(
+            `Failed to resolve contact for history message ${msg.id._serialized}: ${String(error)}`,
+          );
+        }
+        senderContacts.set(senderId, resolved);
+      }
+      const merged = { ...out.contact, ...senderContacts.get(senderId) };
+      if (Object.keys(merged).length > 0) {
+        out.contact = merged;
+      }
       const call = extractWwebjsCall(msg);
       if (call) out.call = call;
       // Mirror the live handler's location + quoted-message enrichment so history renders identically —

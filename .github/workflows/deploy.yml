@@ -1,0 +1,74 @@
+run-name: Deploy to ${{ github.ref_name }} by @${{ github.actor }} - ${{ github.event.head_commit.message }}
+
+on:
+  push:
+    branches:
+      - "deploy"
+    paths-ignore:
+      - "README.md"
+      - "LICENSE"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+name: Deploy
+
+jobs:
+  build:
+    name: Build And Deploy
+    runs-on: ubuntu-latest
+    env:
+      WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+    steps:
+      - uses: actions/checkout@master
+      - name: 🚀 Run deploy
+        uses: appleboy/ssh-action@master
+        with:
+          host: svr.bazarbangunan.com
+          port: 65100
+          username: ${{ secrets.SSH_USERNAME }}
+          password: ${{ secrets.SSH_PASSWORD }}
+          script: |
+            cd public_html
+            ./deploy.sh
+
+      - name: 📢 Notify deployment completed
+        if: success() && env.WEBHOOK_URL != ''
+        run: |
+          curl -X POST "$WEBHOOK_URL" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"event\": \"deployment_completed\",
+              \"environment\": \"staging\",
+              \"branch\": \"${{ github.ref_name }}\",
+              \"commit\": \"${{ github.sha }}\",
+              \"actor\": \"${{ github.actor }}\",
+              \"timestamp\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",
+              \"repository\": \"${{ github.repository }}\",
+              \"message\": \"${{ github.event.head_commit.message }}\",
+              \"status\": \"success\"
+            }"
+
+      - name: 📢 Notify deployment failed
+        if: failure() && env.WEBHOOK_URL != ''
+        run: |
+          curl -X POST "$WEBHOOK_URL" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"event\": \"deployment_failed\",
+              \"environment\": \"staging\",
+              \"branch\": \"${{ github.ref_name }}\",
+              \"commit\": \"${{ github.sha }}\",
+              \"actor\": \"${{ github.actor }}\",
+              \"timestamp\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",
+              \"repository\": \"${{ github.repository }}\",
+              \"message\": \"${{ github.event.head_commit.message }}\",
+              \"status\": \"failed\"
+            }"

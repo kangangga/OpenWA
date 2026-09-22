@@ -1,10 +1,10 @@
 import { Controller, Get } from '@nestjs/common';
 import { createLogger } from '../../common/services/logger.service';
-import { RequireUnscopedKey } from '../auth/decorators/auth.decorators';
+import { Public } from '../auth/decorators/auth.decorators';
 import { ConfigService } from '@nestjs/config';
 
 @Controller('infra')
-@RequireUnscopedKey()
+@Public()
 export class InfraLayoutController {
   private readonly logger = createLogger('InfraLayoutController');
 

@@ -949,6 +949,7 @@ export interface InfraLayout {
   brand: {
     name: string;
     logoUrl: string;
+    iconUrl: string;
   };
 }
 

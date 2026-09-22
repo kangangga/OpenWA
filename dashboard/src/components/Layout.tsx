@@ -165,7 +165,7 @@ export function Layout({ onLogout, userRole }: LayoutProps) {
             {isMobileOpen ? <X size={24} /> : <Menu size={24} />}
           </button>
           <div className="mobile-brand">
-            <img src={layout?.brand.logoUrl} alt={layout?.brand.name} className="sidebar-logo" />
+            <img src={layout?.brand.iconUrl} alt={layout?.brand.name} className="sidebar-logo" />
             <span className="brand-name">{layout?.brand.name}</span>
           </div>
           <div style={{ width: 40 }} />
@@ -178,7 +178,7 @@ export function Layout({ onLogout, userRole }: LayoutProps) {
         className={`sidebar ${isCollapsed ? 'collapsed' : ''} ${isMobile ? 'mobile' : ''} ${isMobileOpen ? 'open' : ''}`}
       >
         <div className="sidebar-header">
-          <img src={layout?.brand.logoUrl} alt={layout?.brand.name} className="sidebar-logo" />
+          <img src={layout?.brand.iconUrl} alt={layout?.brand.name} className="sidebar-logo" />
           {!isCollapsed && (
             <div className="sidebar-brand">
               <span className="brand-name">{layout?.brand.name}</span>

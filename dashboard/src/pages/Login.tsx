@@ -23,7 +23,7 @@ export function Login({ onLogin }: LoginProps) {
     void i18n.changeLanguage(language);
   };
 
-  const handleSubmit = async (e: React.FormEvent) => {
+  const handleSubmit = async (e: React.SubmitEvent) => {
     e.preventDefault();
     if (!apiKey.trim()) {
       setError(t('login.apiKeyRequired'));

@@ -9,6 +9,7 @@ import { createInflightBodyBudget, resolveInflightBodyBudgetBytes } from './conf
 import { requestContextMiddleware } from './common/middleware/request-context.middleware';
 import { injectDashboardCspNonce } from './config/dashboard-csp';
 import { resolveCorsPolicy, isUpgradeInsecureRequestsEnabled, resolveBodyLimit } from './config/bootstrap-security';
+import { ConfigService } from '@nestjs/config';
 
 /** Where the bundled dashboard documents come from, and whether to serve them at all. */
 export interface DashboardSource {
@@ -160,6 +161,8 @@ export function configureApp(app: INestApplication, options: ConfigureAppOptions
   // response header. A shared cookie is deliberately avoided: a second dashboard tab could overwrite
   // it and make the first tab's srcdoc scripts fail CSP. Assets and Nest-owned routes fall through.
   if (dashboard.enabled && existsSync(join(dashboard.distDir, 'index.html'))) {
+    const configService = app.get(ConfigService);
+
     const dashboardIndex = readFileSync(join(dashboard.distDir, 'index.html'), 'utf8');
     app.use((req: Request, res: Response, next: NextFunction) => {
       const excluded =
@@ -177,6 +180,8 @@ export function configureApp(app: INestApplication, options: ConfigureAppOptions
       if (!documentRequest) return next();
 
       res.setHeader('Cache-Control', 'no-store');
+
+      dashboardIndex.split('__TITLE__').join(configService.get('layout.brand.name'));
       res.type('html').send(injectDashboardCspNonce(dashboardIndex, res.locals.cspNonce as string));
     });
   }

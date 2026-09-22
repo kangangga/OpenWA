@@ -16,6 +16,7 @@ export class InfraLayoutController {
       brand: {
         name: this.configService.get('layout.brand.name'),
         logoUrl: this.configService.get('layout.brand.logoUrl'),
+        iconUrl: this.configService.get('layout.brand.iconUrl'),
       },
     };
   }

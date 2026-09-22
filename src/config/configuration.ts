@@ -91,6 +91,7 @@ export default () => ({
     brand: {
       name: process.env.BRAND_NAME,
       logoUrl: process.env.BRAND_LOGO,
+      iconUrl: process.env.BRAND_ICON,
     },
   },
 

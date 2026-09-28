@@ -97,7 +97,6 @@ export class SessionController {
     const session = await this.sessionService.create(dto);
     await this.auditService.logInfo(AuditAction.SESSION_CREATED, {
       sessionId: session.id,
-      branchId: session.branch_id,
       sessionName: session.name,
     });
     return this.transformSession(session);

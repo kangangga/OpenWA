@@ -191,62 +191,60 @@ export function configureApp(app: INestApplication, options: ConfigureAppOptions
     });
   }
 
-  // CORS Configuration (#221 hardening)
-  const corsPolicy = resolveCorsPolicy(process.env.CORS_ORIGINS, process.env.NODE_ENV);
-  if (process.env.NODE_ENV === 'production' && corsPolicy.origins.length === 0 && !corsPolicy.allowAnyOrigin) {
-    console.warn(
-      '[Bootstrap] No explicit CORS_ORIGINS in production (wildcard "*" is refused): cross-origin browser ' +
-        'requests will be blocked. Set CORS_ORIGINS to your dashboard origin(s).',
-    );
-  }
   app.enableCors({
-    origin: (origin: string | undefined, callback: (err: Error | null, allow?: boolean) => void) => {
-      // Allow requests with no origin (mobile apps, Postman, server-to-server)
-      if (!origin) return callback(null, true);
-
-      if (corsPolicy.allowAnyOrigin || corsPolicy.origins.includes(origin)) {
-        callback(null, true);
-      } else {
-        // Deny WITHOUT throwing. Throwing here surfaced as a 500 Internal Server Error (#250).
-        // Returning false simply omits the CORS headers: the browser blocks a true cross-origin
-        // request itself (correct), while same-origin requests — e.g. the bundled dashboard served
-        // through the proxy, which the browser never subjects to CORS — keep working. A genuine
-        // cross-origin dashboard still needs its origin in CORS_ORIGINS.
-        callback(null, false);
-      }
-    },
-    credentials: corsPolicy.credentials,
-    methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'X-API-Key', 'Authorization', 'X-Request-ID'],
-    // The throttlers are named (short/medium/long, plus instance and ingress-ip on ingress), so
-    // @nestjs/throttler suffixes every rate-limit header with the throttler name. Expose the suffixed
-    // names so browser clients can actually read them, plus the plain `Retry-After` the guard adds
-    // on top of them, which is not CORS-safelisted either.
-    exposedHeaders: [
-      'X-RateLimit-Limit-short',
-      'X-RateLimit-Remaining-short',
-      'X-RateLimit-Reset-short',
-      'X-RateLimit-Limit-medium',
-      'X-RateLimit-Remaining-medium',
-      'X-RateLimit-Reset-medium',
-      'X-RateLimit-Limit-long',
-      'X-RateLimit-Remaining-long',
-      'X-RateLimit-Reset-long',
-      'X-RateLimit-Limit-instance',
-      'X-RateLimit-Remaining-instance',
-      'X-RateLimit-Reset-instance',
-      'X-RateLimit-Limit-ingress-ip',
-      'X-RateLimit-Remaining-ingress-ip',
-      'X-RateLimit-Reset-ingress-ip',
-      'Retry-After',
-      'Retry-After-short',
-      'Retry-After-medium',
-      'Retry-After-long',
-      'Retry-After-instance',
-      'Retry-After-ingress-ip',
-    ],
-    maxAge: 86400, // 24 hours
+    origin: '*',
+    credentials: false,
   });
+  // CORS Configuration (#221 hardening)
+  // const corsPolicy = resolveCorsPolicy(process.env.CORS_ORIGINS, process.env.NODE_ENV);
+  // app.enableCors({
+  //   origin: (origin: string | undefined, callback: (err: Error | null, allow?: boolean) => void) => {
+  //     // Allow requests with no origin (mobile apps, Postman, server-to-server)
+  //     if (!origin) return callback(null, true);
+
+  //     if (corsPolicy.allowAnyOrigin || corsPolicy.origins.includes(origin)) {
+  //       callback(null, true);
+  //     } else {
+  //       // Deny WITHOUT throwing. Throwing here surfaced as a 500 Internal Server Error (#250).
+  //       // Returning false simply omits the CORS headers: the browser blocks a true cross-origin
+  //       // request itself (correct), while same-origin requests — e.g. the bundled dashboard served
+  //       // through the proxy, which the browser never subjects to CORS — keep working. A genuine
+  //       // cross-origin dashboard still needs its origin in CORS_ORIGINS.
+  //       callback(null, false);
+  //     }
+  //   },
+  //   credentials: corsPolicy.credentials,
+  //   methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
+  //   allowedHeaders: ['Content-Type', 'X-API-Key', 'Authorization', 'X-Request-ID'],
+  //   // The throttlers are named (short/medium/long, plus instance and ingress-ip on ingress), so
+  //   // @nestjs/throttler suffixes every rate-limit header with the throttler name. Expose the suffixed
+  //   // names so browser clients can actually read them, plus the plain `Retry-After` the guard adds
+  //   // on top of them, which is not CORS-safelisted either.
+  //   exposedHeaders: [
+  //     'X-RateLimit-Limit-short',
+  //     'X-RateLimit-Remaining-short',
+  //     'X-RateLimit-Reset-short',
+  //     'X-RateLimit-Limit-medium',
+  //     'X-RateLimit-Remaining-medium',
+  //     'X-RateLimit-Reset-medium',
+  //     'X-RateLimit-Limit-long',
+  //     'X-RateLimit-Remaining-long',
+  //     'X-RateLimit-Reset-long',
+  //     'X-RateLimit-Limit-instance',
+  //     'X-RateLimit-Remaining-instance',
+  //     'X-RateLimit-Reset-instance',
+  //     'X-RateLimit-Limit-ingress-ip',
+  //     'X-RateLimit-Remaining-ingress-ip',
+  //     'X-RateLimit-Reset-ingress-ip',
+  //     'Retry-After',
+  //     'Retry-After-short',
+  //     'Retry-After-medium',
+  //     'Retry-After-long',
+  //     'Retry-After-instance',
+  //     'Retry-After-ingress-ip',
+  //   ],
+  //   maxAge: 86400, // 24 hours
+  // });
 
   return { bodyLimit, inflightBudgetBytes };
 }

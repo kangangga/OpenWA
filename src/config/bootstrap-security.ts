@@ -14,12 +14,10 @@ export interface CorsPolicy {
  *   misconfigured deployment cannot reflect arbitrary origins with credentials.
  */
 export function resolveCorsPolicy(_: any, __: any): CorsPolicy {
-  const origins = ['*'];
-  const hasWildcard = origins.includes('*');
   return {
-    origins,
-    allowAnyOrigin: hasWildcard,
-    credentials: !hasWildcard,
+    origins: ['*'],
+    credentials: false,
+    allowAnyOrigin: true,
   };
 }
 /**

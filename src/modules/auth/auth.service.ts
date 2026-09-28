@@ -18,6 +18,7 @@ import { createLogger } from '../../common/services/logger.service';
 import { readBootstrapKey, removeBootstrapKey, writeBootstrapKey } from './bootstrap-key-file';
 import { ApiKeyUsageTracker } from './api-key-usage-tracker.service';
 import { apiKeyAuthorizationFingerprint, normalizeScopeList } from './api-key-authorization';
+import { normalizeChatAllowList } from '../../common/security/chat-scope';
 import { EventsGateway, type ApiKeyEvictionReason } from '../events/events.gateway';
 
 /**
@@ -28,8 +29,11 @@ import { EventsGateway, type ApiKeyEvictionReason } from '../events/events.gatew
  * a developer explicitly opts in with `ALLOW_DEV_API_KEY=true`, never by default.
  */
 export function resolveSeedApiKey(): string {
-  if (process.env.API_MASTER_KEY) {
-    return process.env.API_MASTER_KEY;
+  // Trimmed because validateApiKey hashes the trimmed key: a seed hashed with a trailing newline could
+  // never authenticate. A whitespace-only value counts as unset.
+  const masterKey = process.env.API_MASTER_KEY?.trim();
+  if (masterKey) {
+    return masterKey;
   }
   if (process.env.ALLOW_DEV_API_KEY === 'true') {
     return 'dev-admin-key';
@@ -185,6 +189,7 @@ export class AuthService implements OnModuleInit, OnModuleDestroy {
       role: dto.role || ApiKeyRole.OPERATOR,
       allowedIps: dto.allowedIps || null,
       allowedSessions: normalizeScopeList(dto.allowedSessions),
+      allowedChats: normalizeChatAllowList(dto.allowedChats),
       expiresAt: dto.expiresAt ? new Date(dto.expiresAt) : null,
     });
 
@@ -220,10 +225,11 @@ export class AuthService implements OnModuleInit, OnModuleDestroy {
     const removesOrSchedulesLastAdmin =
       (dto.role !== undefined && dto.role !== ApiKeyRole.ADMIN) ||
       (dto.expiresAt !== undefined && dto.expiresAt !== null) ||
-      (normalizeScopeList(dto.allowedSessions)?.length ?? 0) > 0;
+      (normalizeScopeList(dto.allowedSessions)?.length ?? 0) > 0 ||
+      (normalizeChatAllowList(dto.allowedChats)?.length ?? 0) > 0;
 
     // Capture the authorization-relevant fields BEFORE applying the change. Only a change to role,
-    // allowedIps, allowedSessions, or expiry can widen or restrict what an already-connected WebSocket
+    // allowedIps, allowedSessions, allowedChats, or expiry can widen or restrict what an already-connected WebSocket
     // socket may see, so only those trigger eviction of live /events sockets — a benign rename must
     // NOT disconnect clients. REST enforces the new state immediately; without eviction a live socket
     // keeps streaming events for sessions/IPs the key just lost until it resubscribes or drops.
@@ -231,6 +237,7 @@ export class AuthService implements OnModuleInit, OnModuleDestroy {
       role: apiKey.role,
       allowedIps: apiKey.allowedIps,
       allowedSessions: apiKey.allowedSessions,
+      allowedChats: apiKey.allowedChats,
       expiresAt: apiKey.expiresAt,
     };
 
@@ -239,6 +246,7 @@ export class AuthService implements OnModuleInit, OnModuleDestroy {
     if (dto.role) patch.role = dto.role;
     if (dto.allowedIps !== undefined) patch.allowedIps = dto.allowedIps;
     if (dto.allowedSessions !== undefined) patch.allowedSessions = normalizeScopeList(dto.allowedSessions);
+    if (dto.allowedChats !== undefined) patch.allowedChats = normalizeChatAllowList(dto.allowedChats);
     if (dto.expiresAt !== undefined) patch.expiresAt = dto.expiresAt ? new Date(dto.expiresAt) : null;
 
     let saved: ApiKey;
@@ -333,7 +341,8 @@ export class AuthService implements OnModuleInit, OnModuleDestroy {
     return (
       `${col('role')} = :adminRole AND ${col('isActive')} = 1 AND ` +
       `(${col('expiresAt')} IS NULL OR ${col('expiresAt')} > :guardNow) AND ` +
-      `(${col('allowedSessions')} = '' OR ${col('allowedSessions')} IS NULL)`
+      `(${col('allowedSessions')} = '' OR ${col('allowedSessions')} IS NULL) AND ` +
+      `(${col('allowedChats')} = '' OR ${col('allowedChats')} IS NULL)`
     );
   }
 

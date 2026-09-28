@@ -65,7 +65,8 @@ describe('EventsGateway connection auth + subscribe re-validation', () => {
     disconnect: jest.fn(),
     join: jest.fn(),
     leave: jest.fn(),
-    rooms: new Set<string>(),
+    // Socket.IO puts every socket in a room named after its own id.
+    rooms: new Set<string>(['sock-1']),
   });
   // Subscription rooms joined by the socket; the QR-denied role room is not a subscription.
   const sessionRoomJoins = (s: MockSocket): string[] =>
@@ -124,6 +125,28 @@ describe('EventsGateway connection auth + subscribe re-validation', () => {
     await gateway.handleConnection(asSocket(sock));
     expect(sock.disconnect).not.toHaveBeenCalled();
     expect(sock.data.rawApiKey).toBe('good');
+  });
+
+  it('refuses a chat-restricted key at the handshake (event filtering is a later slice)', async () => {
+    authService.validateApiKey.mockResolvedValue({ name: 'k', allowedSessions: null, allowedChats: ['123@g.us'] });
+    const sock = makeSocket({ apiKey: 'good' });
+    await gateway.handleConnection(asSocket(sock));
+    expect(sock.disconnect).toHaveBeenCalled();
+    expect(sock.emit).toHaveBeenCalled();
+  });
+
+  it('refuses a subscribe once the key has gained allowedChats after connect', async () => {
+    authService.validateApiKey.mockResolvedValueOnce({ name: 'k', allowedSessions: null }); // connect
+    const sock = makeSocket({ apiKey: 'good' });
+    await gateway.handleConnection(asSocket(sock));
+    expect(sock.disconnect).not.toHaveBeenCalled();
+
+    authService.validateApiKey.mockResolvedValueOnce({ name: 'k', allowedSessions: null, allowedChats: ['123@g.us'] });
+    const res = (await gateway.handleMessage(asSocket(sock), subscribeMsg('sess-1', ['*']))) as WSErrorResponse;
+
+    expect(res.code).toBe('UNAUTHORIZED');
+    expect(sock.disconnect).toHaveBeenCalled();
+    expect(sessionRoomJoins(sock)).toEqual([]);
   });
 
   it('re-validates on subscribe and disconnects a key revoked after connect', async () => {
@@ -210,6 +233,51 @@ describe('EventsGateway connection auth + subscribe re-validation', () => {
     expect(res.type).toBe('error');
     expect(res.code).toBe('FORBIDDEN_SESSION');
     expect(sessionRoomJoins(sock)).toEqual([]);
+  });
+
+  // The session id becomes part of every room name the socket keeps until it disconnects, so an
+  // oversized or malformed one must be refused before it costs a key lookup or a room.
+  it.each([
+    ['oversized', 'a'.repeat(129)],
+    ['malformed', 'sess:1'],
+  ])('refuses a %s sessionId with INVALID_SESSION', async (_label, sessionId) => {
+    authService.validateApiKey.mockResolvedValue({ name: 'k', allowedSessions: null });
+    const sock = makeSocket({ apiKey: 'good' });
+    await gateway.handleConnection(asSocket(sock));
+    authService.validateApiKey.mockClear();
+
+    const res = (await gateway.handleMessage(asSocket(sock), subscribeMsg(sessionId, ['*']))) as WSErrorResponse;
+
+    expect(res.code).toBe('INVALID_SESSION');
+    expect(authService.validateApiKey).not.toHaveBeenCalled();
+    expect(sessionRoomJoins(sock)).toEqual([]);
+  });
+
+  it('refuses a subscribe that would take the socket past its room cap', async () => {
+    authService.validateApiKey.mockResolvedValue({ name: 'k', allowedSessions: null });
+    const sock = makeSocket({ apiKey: 'good' });
+    await gateway.handleConnection(asSocket(sock));
+    for (let i = 0; i < 4096; i++) sock.rooms.add(buildRoomName(`s${i}`, '*'));
+
+    const res = (await gateway.handleMessage(asSocket(sock), subscribeMsg('sess-1', ['*']))) as WSErrorResponse;
+    expect(res.code).toBe('TOO_MANY_SUBSCRIPTIONS');
+    expect(sessionRoomJoins(sock)).toEqual([]);
+
+    // Re-subscribing a room the socket already holds adds nothing, so it is still granted.
+    const again = (await gateway.handleMessage(asSocket(sock), subscribeMsg('s1', ['*']))) as WSSubscribedResponse;
+    expect(again.type).toBe('subscribed');
+  });
+
+  it('counts only subscription rooms toward the cap, not the own-id or role rooms', async () => {
+    authService.validateApiKey.mockResolvedValue({ name: 'k', allowedSessions: null });
+    const sock = makeSocket({ apiKey: 'good' });
+    await gateway.handleConnection(asSocket(sock));
+    sock.rooms.add(QR_DENIED_ROOM);
+    for (let i = 0; i < 4095; i++) sock.rooms.add(buildRoomName(`s${i}`, '*'));
+
+    const res = (await gateway.handleMessage(asSocket(sock), subscribeMsg('sess-1', ['*']))) as WSSubscribedResponse;
+    expect(res.type).toBe('subscribed');
+    expect(sessionRoomJoins(sock)).toEqual([buildRoomName('sess-1', '*')]);
   });
 
   it('pushes a command reply on the message event, not only through the ack callback', async () => {
@@ -950,6 +1018,24 @@ describe('EventsGateway rate limiting', () => {
   describe('IPv6 clients are limited on their /64', () => {
     const ipOf = ([, ctx]: [AuditAction, WarnContext?]): unknown =>
       (ctx as { ipAddress?: string } | undefined)?.ipAddress;
+
+    it('refunds an authenticated handshake to the /64 bucket it was charged to', async () => {
+      // The charge lands on the /64; a refund keyed on the full address finds no bucket, so every
+      // authenticated connect from one IPv6 network would spend the shared window after all.
+      process.env.WS_RATE_LIMIT_HANDSHAKE_MAX = '2';
+      process.env.WS_RATE_LIMIT_HANDSHAKE_WINDOW_MS = '60000';
+      process.env.WS_MAX_SOCKETS_PER_KEY = '99';
+      authService.validateApiKey.mockResolvedValue({ id: 'k1', name: 'k', allowedSessions: null });
+      const gw = buildGateway();
+
+      const addresses = ['2001:db8:1:2::a', '2001:db8:1:2::a', '2001:db8:1:2::b', '2001:db8:1:2::c', '2001:db8:1:2::a'];
+      for (const [i, address] of addresses.entries()) {
+        const sock = makeSock(`ok${i}`, { apiKey: 'good' }, address);
+        await gw.handleConnection(asSocket(sock));
+        expect(sock.disconnect).not.toHaveBeenCalled();
+      }
+      expect(authService.validateApiKey).toHaveBeenCalledTimes(addresses.length);
+    });
 
     it('shares the handshake window and the violation sample across a /64, keeping the real address', async () => {
       process.env.WS_RATE_LIMIT_HANDSHAKE_MAX = '1';

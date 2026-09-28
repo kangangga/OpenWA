@@ -507,9 +507,12 @@ export interface Product {
   id: string;
   name: string;
   description?: string;
-  price: number;
-  currency: string;
-  priceFormatted: string;
+  /** Absent when the catalog item carries no price. */
+  price?: number;
+  /** Absent when the catalog item carries no currency. */
+  currency?: string;
+  /** Present only when price is. */
+  priceFormatted?: string;
   imageUrl?: string;
   url: string;
   isAvailable: boolean;
@@ -1087,13 +1090,14 @@ export interface MessageOperationsCapability {
  */
 export interface ChatHistoryCapability {
   /**
-   * Read a chat's recent messages, newest first. When `includeMedia` downloads blobs, an optional
-   * `mediaMaxBytes` tightens the declared-size pre-gate below the global MEDIA_DOWNLOAD_MAX_BYTES —
+   * Read a chat's most recent `limit` messages, returned oldest first (ascending timestamp). When
+   * `includeMedia` downloads blobs, an optional `mediaMaxBytes` tightens the declared-size pre-gate
+   * below the global MEDIA_DOWNLOAD_MAX_BYTES —
    * the status seed uses it to skip downloads the store would discard as over-cap anyway.
-   * Inlined media is additionally bounded in aggregate (CHAT_HISTORY_MEDIA_BUDGET_BYTES): once the
-   * running base64 total crosses the budget, later media messages carry the `omitted` marker instead
-   * of a download. An optional `signal` (e.g. client disconnect) stops the read loop early; the
-   * messages collected so far are returned.
+   * Inlined media is additionally bounded in aggregate (CHAT_HISTORY_MEDIA_BUDGET_BYTES), spent in
+   * that same order: once the running base64 total crosses the budget, the newer media messages
+   * carry the `omitted` marker instead of a download. An optional `signal` (e.g. client disconnect)
+   * stops the read loop early; the messages collected so far are returned.
    */
   getChatHistory(
     chatId: string,
@@ -1488,9 +1492,17 @@ export interface PresenceCapability {
    * A linked device that announces itself online routes notifications away from the phone, so a
    * headless bot that never goes offline suppresses the phone's own alerts — which is why this is
    * NOT best-effort, unlike sendChatState: the caller asked for a specific visibility, and a
-   * swallowed failure would leave the account silently online. The setting belongs to the
-   * connection and resets on reconnect (Baileys re-announces per its `markOnlineOnConnect`
-   * socket option), so callers re-issue it after a reconnect.
+   * swallowed failure would leave the account silently online. Chat-state updates are a separate
+   * wire operation (`<chatstate>` / `sendStateTyping`) and do not publish this.
+   *
+   * The call itself is one-shot. The gateway remembers a successful one for the life of the running
+   * engine and re-applies it once each time that connection opens: Baileys announces itself on
+   * connect per `markOnlineOnConnect` (`available` by default), which would otherwise replace the
+   * caller's choice on a transient reconnect. Replacing the engine drops the preference: stop,
+   * restart, reconnect recovery, a watchdog recycle, or a takeover by another node.
+   *
+   * On Baileys this throws when the account push name is not set yet. `sendPresenceUpdate`
+   * resolves without sending in that case (`no name present, ignoring presence update request`).
    */
   setOnlinePresence(available: boolean): Promise<void>;
 

@@ -1,6 +1,8 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { getRepositoryToken } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
+import { FindOperator, In, Repository } from 'typeorm';
+import { LidMappingStoreService } from '../../engine/identity/lid-mapping-store.service';
+import type { LidMapping } from '../../engine/identity/lid-mapping.entity';
 import { BadRequestException, NotFoundException, PayloadTooLargeException } from '@nestjs/common';
 import { MessageSendService } from './message-send.service';
 import { Message, MessageDirection, MessageStatus } from './entities/message.entity';
@@ -12,6 +14,7 @@ import { TemplateService } from '../template/template.service';
 import { Template } from '../template/entities/template.entity';
 import { SsrfBlockedError } from '../../common/security/ssrf-guard';
 import { SendPacingService } from './send-pacing.service';
+import type { MessageProjector } from '../session/message-projector.service';
 
 /** Pacing is off by default in these tests; the governor's own spec covers its behaviour. */
 const inertPacing = (): SendPacingService =>
@@ -121,6 +124,7 @@ describe('MessageSendService', () => {
 
       await service.sendText('sess-1', { chatId: '628123456789@c.us', text: 'Hello' });
 
+      expect(mockEngine.sendChatState).toHaveBeenCalledTimes(1);
       expect(mockEngine.sendChatState).toHaveBeenCalledWith('628123456789@c.us', 'typing');
       expect(mockEngine.sendTextMessage).toHaveBeenCalledWith('628123456789@c.us', 'Hello');
     });
@@ -980,9 +984,7 @@ describe('MessageSendService', () => {
         quotedMessageId: 'wa-quoted-9',
       });
 
-      expect(repository.findOne).toHaveBeenCalledWith({
-        where: { sessionId: 'sess-1', waMessageId: 'wa-quoted-9' },
-      });
+      expect(repository.findOne).toHaveBeenCalledWith({ where: { sessionId: 'sess-1', waMessageId: 'wa-quoted-9' } });
       expect(repository.create).toHaveBeenCalledWith(
         expect.objectContaining({
           metadata: expect.objectContaining({
@@ -1007,6 +1009,151 @@ describe('MessageSendService', () => {
           metadata: expect.objectContaining({ quotedMessage: { id: 'wa-quoted-9', body: '' } }) as unknown,
         }),
       );
+    });
+  });
+
+  describe('a reply or button click reads the quoted body from the target chat only', () => {
+    // A stored row per chat. The fake honours the WHERE clause, so a lookup that ignores the chat
+    // would find the foreign row and copy its body.
+    const rows = [
+      { sessionId: 'sess-1', chatId: 'other@g.us', waMessageId: 'wa-foreign', body: 'not yours' },
+      { sessionId: 'sess-1', chatId: '999@lid', waMessageId: 'wa-own', body: 'same chat, lid form' },
+    ];
+    const honourWhere = (opts: { where: { sessionId: string; chatId?: FindOperator<string>; waMessageId: string } }) =>
+      Promise.resolve(
+        rows.find(
+          r =>
+            r.sessionId === opts.where.sessionId &&
+            r.waMessageId === opts.where.waMessageId &&
+            (!opts.where.chatId || (opts.where.chatId.value as unknown as string[]).includes(r.chatId)),
+        ) ?? null,
+      );
+    const quoteOf = (): unknown => {
+      const calls = (repository.create as jest.Mock).mock.calls as [{ metadata: { quotedMessage: unknown } }][];
+      return calls[0][0].metadata.quotedMessage;
+    };
+
+    beforeEach(() => {
+      (repository.findOne as jest.Mock).mockImplementation(honourWhere);
+    });
+
+    it('reply stores no body for a message id from another chat', async () => {
+      await service.reply('sess-1', { chatId: '628111@c.us', quotedMessageId: 'wa-foreign', text: 'hi' });
+      expect(quoteOf()).toEqual({ id: 'wa-foreign', body: '' });
+    });
+
+    it('clickButton stores no prompt body for a message id from another chat', async () => {
+      await service.clickButton('sess-1', { chatId: '628111@c.us', messageId: 'wa-foreign', buttonId: 'yes' });
+      expect(quoteOf()).toEqual({ id: 'wa-foreign', body: '' });
+    });
+
+    it('a quoting send keeps a quote from another chat, which the send routes allow', async () => {
+      await service.sendText('sess-1', { chatId: '628111@c.us', text: 'hi', quotedMessageId: 'wa-foreign' });
+      expect(quoteOf()).toEqual({ id: 'wa-foreign', body: 'not yours' });
+    });
+
+    it('stores no body from the chat a stale cached lid mapping names', async () => {
+      // This node cached lid 999 -> 628111; another node has since re-mapped it to 628333 in the
+      // shared table. A reply to 999@lid must not read a quote out of chat 628111.
+      rows.push({ sessionId: 'sess-1', chatId: '628111@c.us', waMessageId: 'wa-stale', body: 'chat 628111 only' });
+      const table = [{ lid: '999', phone: '628111' }];
+      const store = new LidMappingStoreService({
+        find: () => Promise.resolve([]),
+        findOne: ({ where }: { where: { lid: string } }) =>
+          Promise.resolve(table.find(r => r.lid === where.lid) ?? null),
+        upsert: () => Promise.resolve({}),
+      } as unknown as Repository<LidMapping>);
+      await store.remember('999', '628111');
+      table[0].phone = '628333';
+      const withStore = new MessageSendService(
+        repository as Repository<Message>,
+        sessionService as unknown as SessionService,
+        engines,
+        hookManager as HookManager,
+        templateService as unknown as TemplateService,
+        inertPacing(),
+        undefined,
+        undefined,
+        store,
+      );
+      try {
+        await withStore.reply('sess-1', { chatId: '999@lid', quotedMessageId: 'wa-stale', text: 'hi' });
+        expect(quoteOf()).toEqual({ id: 'wa-stale', body: '' });
+      } finally {
+        rows.pop();
+      }
+    });
+
+    it('still finds a quote stored under the lid form of the target chat', async () => {
+      const store = {
+        findPhoneForLid: jest.fn().mockResolvedValue(null),
+        findLidsForPhone: jest.fn((phone: string) => Promise.resolve(phone === '628111' ? ['999'] : [])),
+      } as unknown as LidMappingStoreService;
+      const withStore = new MessageSendService(
+        repository as Repository<Message>,
+        sessionService as unknown as SessionService,
+        engines,
+        hookManager as HookManager,
+        templateService as unknown as TemplateService,
+        inertPacing(),
+        undefined,
+        undefined,
+        store,
+      );
+      await withStore.reply('sess-1', { chatId: '628111@c.us', quotedMessageId: 'wa-own', text: 'hi' });
+      expect(quoteOf()).toEqual({ id: 'wa-own', body: 'same chat, lid form' });
+    });
+  });
+
+  describe('quoting a message whose message:received hooks are still running', () => {
+    // A plugin that replies from its message:received hook sends before the inbound row is written,
+    // so the table has nothing to quote. The projector's in-flight copy stands in for it.
+    const inFlight = { chatId: '628111@c.us', body: 'what are your hours?' };
+    const quoteOf = (): unknown => {
+      const calls = (repository.create as jest.Mock).mock.calls as [{ metadata: { quotedMessage: unknown } }][];
+      return calls[0][0].metadata.quotedMessage;
+    };
+    const withProjector = (live: { chatId: string; body: unknown } = inFlight): MessageSendService =>
+      new MessageSendService(
+        repository as Repository<Message>,
+        sessionService as unknown as SessionService,
+        engines,
+        hookManager as HookManager,
+        templateService as unknown as TemplateService,
+        inertPacing(),
+        undefined,
+        undefined,
+        undefined,
+        {
+          inFlightInbound: jest.fn((sessionId: string, id: string) =>
+            sessionId === 'sess-1' && id === 'wa-live' ? live : undefined,
+          ),
+        } as unknown as MessageProjector,
+      );
+
+    it('reply stores the body of the message the hook chain carries', async () => {
+      await withProjector().reply('sess-1', { chatId: '628111@c.us', quotedMessageId: 'wa-live', text: '9 to 5' });
+      expect(quoteOf()).toEqual({ id: 'wa-live', body: 'what are your hours?' });
+    });
+
+    it('a quoting send stores it too', async () => {
+      await withProjector().sendText('sess-1', { chatId: '628111@c.us', text: '9 to 5', quotedMessageId: 'wa-live' });
+      expect(quoteOf()).toEqual({ id: 'wa-live', body: 'what are your hours?' });
+    });
+
+    it('reply does not copy the in-flight body into another chat', async () => {
+      await withProjector().reply('sess-1', { chatId: '628999@c.us', quotedMessageId: 'wa-live', text: 'hi' });
+      expect(quoteOf()).toEqual({ id: 'wa-live', body: '' });
+    });
+
+    it('quotes a body a hook rewrote into something other than text as empty', async () => {
+      // A rewrite is only checked for its id and chatId; the dashboard renders the quote as a string.
+      await withProjector({ chatId: '628111@c.us', body: 42 }).reply('sess-1', {
+        chatId: '628111@c.us',
+        quotedMessageId: 'wa-live',
+        text: 'hi',
+      });
+      expect(quoteOf()).toEqual({ id: 'wa-live', body: '' });
     });
   });
 
@@ -1117,7 +1264,7 @@ describe('MessageSendService', () => {
       // The lookup is scoped to the session: without it, one session's prompt body could be quoted
       // into another session's outgoing row.
       expect(repository.findOne).toHaveBeenCalledWith({
-        where: { sessionId: 'sess-1', waMessageId: 'PROMPT-1' },
+        where: { sessionId: 'sess-1', chatId: In(['test@c.us', 'test@s.whatsapp.net']), waMessageId: 'PROMPT-1' },
       });
       expect(repository.create).toHaveBeenCalledWith(
         expect.objectContaining({

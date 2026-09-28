@@ -171,23 +171,31 @@ a host version, except for the SDK-major check applied to a manifest that declar
 | `configUi`              | —        | Optional self-contained HTML config editor served into a sandboxed iframe. When present it **replaces** the generated form and owns saving — the dashboard renders neither the form nor its Save button                                                                                              |
 | `hooks`                 | —        | Hook events this plugin listens to (informational)                                                                                                                                                                                                                                                   |
 | `provides` / `requires` | —        | Features this plugin provides / depends on                                                                                                                                                                                                                                                           |
-| `i18n`                  | —        | Localized dashboard text per locale (dashboard-only)                                                                                                                                                                                                                                                 |
+| `i18n`                  | —        | Localized dashboard text per locale (dashboard-only; a `configUi` editor receives it through the localized `schema`)                                                                                                                                                                                 |
 
 **The `configUi` bridge.** The editor is injected as `srcdoc` into a `sandbox="allow-scripts"` iframe, so
 it has an opaque origin and no access to the dashboard. It talks to the host by `postMessage`:
 
-| Direction     | Message                                                          | Notes                                                                                       |
-| ------------- | ---------------------------------------------------------------- | ------------------------------------------------------------------------------------------- |
-| iframe → host | `{ type: 'config:get' }`                                         | Sent on load; the host answers with the current values                                      |
-| host → iframe | `{ type: 'config:value', config, schema, theme }`                | `config` is already secret-redacted. `theme` is `'light'` or `'dark'`, resolved by the host |
-| iframe → host | `{ type: 'config:save', config }`                                | The host makes the authenticated write                                                      |
-| host → iframe | `{ type: 'config:saved' }` / `{ type: 'config:error', message }` | Outcome of that write                                                                       |
+| Direction     | Message                                                          | Notes                                                                                                                                                        |
+| ------------- | ---------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| iframe → host | `{ type: 'config:get' }`                                         | Sent on load; the host answers with the current values                                                                                                       |
+| host → iframe | `{ type: 'config:value', config, schema, locale, theme }`        | `config` is already secret-redacted. `schema` text is localized for `locale`, the dashboard language. `theme` is `'light'` or `'dark'`, resolved by the host |
+| iframe → host | `{ type: 'config:save', config }`                                | The host makes the authenticated write                                                                                                                       |
+| host → iframe | `{ type: 'config:saved' }` / `{ type: 'config:error', message }` | Outcome of that write                                                                                                                                        |
 
 `theme` matters because an opaque-origin iframe cannot read the dashboard's theme for itself; without it
 an editor can only guess, and a light-only editor becomes a glaring white panel inside a dark modal. It is
 sent once, with the handshake — the theme control sits behind the modal overlay, so the theme cannot
 change while an editor is open. Treat it as optional: an editor that ignores it still works, and one that
 uses it should fall back to `prefers-color-scheme` so it stays readable on an older host.
+
+`locale` is the dashboard's language code (`'es'`, `'zh-CN'`, ...), sent for the same reason: the iframe
+cannot read the operator's language setting, and `navigator.language` differs from it whenever the
+operator picked a language other than the browser's. The `schema` in the same message carries field
+titles and descriptions localized from the manifest `i18n` block for that code, the same text the
+generated form shows. Everything else in the editor (its own labels, buttons, messages) is the editor's
+to translate from `locale`. Treat it as optional too, and fall back to `navigator.language` on an older
+host.
 
 A `configSchema` field may set `secret: true` (e.g. an API key): the value is masked on read and
 preserved on an unchanged write.
@@ -329,7 +337,7 @@ export interface PluginEngineReadCapability {
   getContactById(sessionId: string, contactId: string): Promise<...>;
   checkNumberExists(sessionId: string, phone: string): Promise<...>;
   getChats(sessionId: string): Promise<...>;
-  // Recent messages for a chat, both directions (history backfill). `limit` is clamped host-side to 1-100.
+  // Recent messages for a chat, both directions, oldest first (history backfill). `limit` is clamped host-side to 1-100.
   getChatHistory(sessionId: string, chatId: string, limit?: number, includeMedia?: boolean): Promise<...>;
   // Canonical form of a chat id: resolves a known '@lid' privacy id to its stable '<phone>@c.us',
   // otherwise returns the id unchanged (best-effort).
@@ -413,6 +421,13 @@ plain-object `payload` the same way.
 On a **pre-action** event it is a veto, because the action has not been taken yet: `false` on
 `message:sending` blocks the send (the caller gets a `400`), and on `webhook:before` it cancels that one
 delivery.
+
+A bulk send (`POST /api/sessions/:sessionId/messages/send-bulk`) runs `message:sending` once per item,
+and fires `message:failed` for an item that fails for any reason other than a plugin block or a pacing
+refusal. Both carry the item's content with its recipient `chatId` added as `input`, so a handler that
+reads `input.chatId` on a single send reads it here too. A handler may rewrite the content, but a
+rewritten `chatId` is ignored: the item always goes to its own recipient. On a single send the rewritten
+`input` is what gets sent, `chatId` included.
 
 > **`message:sending` does not see every attempted send.** With send pacing enabled
 > (`SEND_PACING_ENABLED`), the pacing governor runs _before_ this hook, so a send it refuses never
@@ -641,7 +656,7 @@ URL / catalog), not an npm/github source descriptor.
 | `GET /plugins/catalog`               | List the remote plugin catalog, annotated with install state                                               |
 | `GET /plugins/:id`                   | Get a single plugin                                                                                        |
 | `POST /plugins/install`              | Install from an uploaded `.zip` (`multipart/form-data`, field `file`, ≤ 5 MB)                              |
-| `POST /plugins/install-url`          | Install by downloading a `.zip` from an https URL (SSRF-guarded; optional `#sha256=` digest pin)           |
+| `POST /plugins/install-url`          | Install by downloading a `.zip` from an https URL (SSRF-guarded; `#sha256=` pin required in production)    |
 | `POST /plugins/:id/update`           | Update an installed plugin in place from a URL (staged swap, crash-safe; preserves config + enabled state) |
 | `POST /plugins/:id/enable`           | Enable a plugin                                                                                            |
 | `POST /plugins/:id/disable`          | Disable a plugin                                                                                           |

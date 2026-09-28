@@ -7,6 +7,7 @@ import { AuditService } from '../../modules/audit/audit.service';
 import { AuditAction } from '../../modules/audit/entities/audit-log.entity';
 import { KeyRateLimiter, readIpRateLimitConfig } from '../../modules/mcp/mcp-rate-limit';
 import { limiterKeyForIp, resolveClientIp } from '../utils/ip';
+import { bearerToken } from './bearer-token';
 import { setRequestActor } from '../services/request-context';
 
 /**
@@ -92,6 +93,14 @@ export class BullBoardAuthMiddleware implements NestMiddleware {
         throw new ForbiddenException('API keys restricted to specific sessions cannot access the queue dashboard');
       }
 
+      // A key restricted to selected chats is refused here too. This mount is the third surface
+      // outside ApiKeyGuard (beside /events and the MCP mount), and the board shows and mutates the
+      // webhook job queue, whose payloads carry every chat's events — so it has no chat dimension to
+      // scope against and must refuse such a key outright.
+      if ((apiKey.allowedChats?.length ?? 0) > 0) {
+        throw new ForbiddenException('API keys restricted to selected chats cannot access the queue dashboard');
+      }
+
       // Boundary trace of queue-mutation attempts. GET/HEAD are the UI's read/poll traffic; every
       // other method reaching the Bull Board router mutates queue state, so record it with the
       // authenticated key, the resolved client IP, and the method + full path (no query string).
@@ -133,11 +142,8 @@ export class BullBoardAuthMiddleware implements NestMiddleware {
     const header = req.headers['x-api-key'];
     if (typeof header === 'string' && header) return header;
 
-    const authHeader = req.headers['authorization'];
-    if (authHeader?.startsWith('Bearer ')) return authHeader.slice(7);
-
     // No ?apiKey query fallback — an admin key in the URL leaks into logs/history.
-    return undefined;
+    return bearerToken(req.headers['authorization']);
   }
 
   private getClientIp(req: Request): string {

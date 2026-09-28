@@ -81,6 +81,27 @@ describe('BullBoardAuthMiddleware', () => {
     expect((forwarded as ForbiddenException).message).toContain('restricted');
   });
 
+  it('rejects an ADMIN key that is restricted to specific chats', async () => {
+    authService.validateApiKey.mockResolvedValue({
+      id: 'key-chat',
+      name: 'chat-scoped-admin',
+      role: ApiKeyRole.ADMIN,
+      allowedSessions: null,
+      allowedChats: ['123@g.us'],
+    });
+    authService.hasPermission.mockReturnValue(true);
+
+    const req = reqWith({ 'x-api-key': 'raw-key' });
+    const next = jest.fn();
+
+    await mw.use(req, res, next);
+
+    expect(next).toHaveBeenCalledTimes(1);
+    const forwarded = (next.mock.calls as Array<Array<unknown>>)[0]?.[0];
+    expect(forwarded).toBeInstanceOf(ForbiddenException);
+    expect((forwarded as ForbiddenException).message).toContain('restricted to selected chats');
+  });
+
   it('admits an ADMIN key with an empty allowedSessions list', async () => {
     authService.validateApiKey.mockResolvedValue({
       id: 'key-2',
@@ -116,6 +137,14 @@ describe('BullBoardAuthMiddleware', () => {
     authService.hasPermission.mockReturnValue(true);
 
     await mw.use(reqWith({ authorization: 'Bearer abc' }), res, jest.fn());
+    expect(authService.validateApiKey).toHaveBeenCalledWith('abc', '127.0.0.1');
+  });
+
+  it('accepts the Bearer scheme in any case', async () => {
+    authService.validateApiKey.mockResolvedValue({ role: ApiKeyRole.ADMIN });
+    authService.hasPermission.mockReturnValue(true);
+
+    await mw.use(reqWith({ authorization: 'bearer abc' }), res, jest.fn());
     expect(authService.validateApiKey).toHaveBeenCalledWith('abc', '127.0.0.1');
   });
 

@@ -1,4 +1,5 @@
 import type { ChatMessage, EngineHistoryMessage, MessageType } from '../services/api';
+import { MENTION_CLOSE, MENTION_OPEN } from './messageFormatter.ts';
 
 export type { EngineHistoryMessage };
 
@@ -110,6 +111,102 @@ export function capMediaPayloads(list: ChatMessageView[], keep = MEDIA_PAYLOAD_C
  * one run with one color.
  */
 export const senderKey = (m: Pick<ChatMessage, 'author' | 'chatName'>): string | undefined => m.author ?? m.chatName;
+
+/**
+ * Maps a group participant's numeric id (the local part of their `author` JID, `:device` suffix
+ * stripped) to their resolved display name — built from every message in the thread that carries
+ * both. An @mention in a message body is just "@<digits>" (WhatsApp never sends a resolved name in
+ * the text itself), and those digits are the same id a mentioned participant's OWN messages carry
+ * as `author` — so any thread where the mentioned person has posted at least once already has
+ * everything needed to resolve the mention, with no separate contact lookup.
+ */
+export function buildMentionNameMap(messages: Pick<ChatMessage, 'author' | 'chatName'>[]): Map<string, string> {
+  const map = new Map<string, string>();
+  for (const m of messages) {
+    if (!m.author || !m.chatName) continue;
+    const local = m.author.split('@')[0].split(':')[0];
+    // A push name is sender-controlled: strip the span delimiters so a name cannot close its own
+    // mention early and hand its tail back to Linkify and the format parser. Backticks go too:
+    // parseMessageBody peels code before it sees a mention span, so one in the name would pair
+    // with another backtick and split the span the same way.
+    const name = m.chatName.replace(MENTION_DELIMITERS, '').replace(/`/g, '').trim();
+    // Rows are ascending by time, so the last write is the participant's current push name.
+    if (name && !blankMentionName(name) && /^\d+$/.test(local)) map.set(local, name);
+  }
+  return map;
+}
+
+const MENTION_DELIMITERS = new RegExp(`[${MENTION_OPEN}${MENTION_CLOSE}]`, 'g');
+
+/**
+ * Drop any span delimiter already present in raw message text. Only resolveMentions may place one:
+ * parseMessageBody reads every MENTION_OPEN...MENTION_CLOSE pair as a mention, so a body that
+ * carries them itself would lose its formatting and links inside the pair.
+ */
+export const stripMentionDelimiters = (text: string): string => text.replace(MENTION_DELIMITERS, '');
+
+// Characters that render as nothing yet survive `.trim()`: format controls (zero-width space, soft
+// hyphen, word joiner, bidi marks), combining marks, the Hangul fillers and the blank braille
+// pattern. A push name made only of these would render as a bare "@".
+const INVISIBLE = /[\p{Cf}\p{M}\u115F\u1160\u3164\uFFA0\u2800]/gu;
+
+function blankMentionName(name: string): boolean {
+  return name.replace(INVISIBLE, '').trim() === '';
+}
+
+// The left boundary is the start of the text or whitespace, optionally followed by a run of opening
+// punctuation or format openers (`*_~`), so `*@digits*` resolves into a bold mention the way
+// WhatsApp renders it while a `_@digits` or `(@digits` inside a URL does not.
+const MENTION_TOKEN = /((?:^|\s)[([{"'*_~]*)@(\d{7,})/gu;
+
+// parseMessageBody peels code after this runs, so a mention inside a code span or block is left as
+// digits here: rewriting it would split the span and render its backticks literally.
+const CODE_SEGMENT = /(```[\s\S]*?```|`[^`]*`)/;
+
+/**
+ * Replace "@<digits>" mention tokens with "@<FirstName>" wherever the digits match a known
+ * participant (see buildMentionNameMap). An unmatched token is left exactly as WhatsApp sent it —
+ * the same fallback WhatsApp's own official clients show for a participant they can't resolve
+ * either, rather than guessing. First name only, matching WhatsApp's own mention convention (a
+ * bare "@FirstName Last Name" reads as the mention swallowing following prose).
+ *
+ * The resolved name is wrapped in MENTION_OPEN/MENTION_CLOSE (private-use-area delimiters
+ * messageFormatter.ts's parseMessageBody recognizes as a `mention` node), not spliced in as plain
+ * text: a push name is set freely by any WhatsApp user, and MessageBody renders that node as a
+ * real <bdi> element outside Linkify's ignoreTags-respected walk, so the name can never become a
+ * clickable link (character-stripping alone does not stop linkify-react auto-linking a bare word
+ * like "localhost").
+ *
+ * The left boundary only fires at the start of the text or after whitespace, optionally through
+ * a run of opening punctuation or format markers. It never fires after `/` or a word, so a URL
+ * with the same digits is left untouched, and digits inside a code span are never rewritten (this
+ * runs on the raw body, before parseMessageBody splits out code spans). Right after a closing
+ * backtick a bare "@digits" is left as it is, while an opener run such as `*@digits*` or
+ * `(@digits` still starts a mention: the span has already been split off, so it cannot break.
+ */
+export function resolveMentions(raw: string, names: Map<string, string>): string {
+  const text = stripMentionDelimiters(raw);
+  if (names.size === 0 || !text.includes('@')) return text;
+  return text
+    .split(CODE_SEGMENT)
+    .map((part, i) =>
+      i % 2
+        ? part
+        : part.replace(MENTION_TOKEN, (full: string, prefix: string, digits: string) => {
+            // A bare `^` only counts at the start of the whole text, not right after a closing
+            // backtick; `^` followed by an opener run does (see above).
+            if (i > 0 && prefix === '') return full;
+            // The first word that renders as something: a name like "\u3164 Bob" is not blank as a
+            // whole, but its first word alone would show as a bare "@".
+            const first = names
+              .get(digits)
+              ?.split(' ')
+              .find(word => !blankMentionName(word));
+            return first ? `${prefix}${MENTION_OPEN}@${first}${MENTION_CLOSE}` : full;
+          }),
+    )
+    .join('');
+}
 
 // ChatMessageView extends ChatMessage with the view-only fields the chat page renders.
 // Lifted from Chats.tsx so hooks/utils can share the same shape.

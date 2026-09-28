@@ -13,7 +13,7 @@ export interface CorsPolicy {
  * - Prod: a wildcard origin is REFUSED (collapses to same-origin only) so a
  *   misconfigured deployment cannot reflect arbitrary origins with credentials.
  */
-export function resolveCorsPolicy(corsOriginsEnv?: string): CorsPolicy {
+export function resolveCorsPolicy(_: any, __: any): CorsPolicy {
   const origins = ['*'];
   const hasWildcard = origins.includes('*');
   return {

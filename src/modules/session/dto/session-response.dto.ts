@@ -40,8 +40,9 @@ export class SessionResponseDto {
 
   @ApiProperty({ example: 'my-bot' })
   name!: string;
+
   @ApiPropertyOptional({ type: String, example: 'A1', nullable: true })
-  branch_id!: string;
+  branch_id!: string | null;
 
   @ApiProperty({ enum: SessionStatus, example: SessionStatus.READY })
   status!: SessionStatus;
@@ -118,7 +119,7 @@ export class SessionResponseDto {
     return {
       id: session.id,
       name: session.name,
-      branch_id: session.branch_id,
+      branch_id: session.branch_id ?? null,
       status: session.status,
       phone: session.phone,
       pushName: session.pushName,

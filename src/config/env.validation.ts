@@ -118,14 +118,10 @@ export function validateEnv(config: EnvConfig): EnvConfig {
   }
 
   if (dbType === 'postgres') {
-    if (!dbUrl) {
-      for (const key of ['DATABASE_HOST', 'DATABASE_USERNAME', 'DATABASE_PASSWORD']) {
-        if (!str(key)) {
-          errors.push(`${key} is required when DATABASE_TYPE=postgres`);
-        }
+    for (const key of ['DATABASE_HOST', 'DATABASE_USERNAME', 'DATABASE_PASSWORD']) {
+      if (!str(key)) {
+        errors.push(`${key} is required when DATABASE_TYPE=postgres`);
       }
-    } else if (!isValidDatabaseUrl(dbUrl)) {
-      errors.push('Invalid database URL. Please check DATABASE_URL.');
     }
     // The Postgres data connection always runs migrations (app.module.ts hardcodes migrationsRun=true).
     // An opted-in DATABASE_SYNCHRONIZE=true makes TypeORM re-sync the schema from entities on every

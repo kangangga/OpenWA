@@ -215,9 +215,8 @@ export function assertNoDefaultSecretsInProduction(env: SecretCheckEnv): void {
   // flag AND an internal host: a host-pinned EXTERNAL datastore (even with the built-in flag set) is
   // reachable, so its weak credential is still enforced.
   const dbHost = env.databaseHost?.trim();
-  const dbUrl = env.databaseUrl?.trim();
   const dbExempt = env.postgresBuiltIn === 'true' && (!dbHost || dbHost === 'postgres');
-  if (env.databaseType === 'postgres' && !dbExempt && isWeak(env.databasePassword) && !dbUrl) {
+  if (env.databaseType === 'postgres' && !dbExempt && isWeak(env.databasePassword)) {
     problems.push('DATABASE_PASSWORD');
   }
   const s3Exempt = env.minioBuiltIn === 'true' && isInternalS3Endpoint(env.s3Endpoint);

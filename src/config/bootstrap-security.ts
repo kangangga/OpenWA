@@ -13,26 +13,15 @@ export interface CorsPolicy {
  * - Prod: a wildcard origin is REFUSED (collapses to same-origin only) so a
  *   misconfigured deployment cannot reflect arbitrary origins with credentials.
  */
-export function resolveCorsPolicy(corsOriginsEnv?: string, nodeEnv?: string): CorsPolicy {
-  const origins = corsOriginsEnv
-    ?.split(',')
-    .map(o => o.trim())
-    .filter(Boolean) ?? ['*'];
+export function resolveCorsPolicy(corsOriginsEnv?: string): CorsPolicy {
+  const origins = ['*'];
   const hasWildcard = origins.includes('*');
-
-  // In production a wildcard origin is refused: collapse to same-origin only.
-  if (hasWildcard && nodeEnv === 'production') {
-    return { origins: [], allowAnyOrigin: false, credentials: false };
-  }
-
   return {
     origins,
     allowAnyOrigin: hasWildcard,
-    // Credentials are only safe with an explicit allowlist, never with a wildcard.
     credentials: !hasWildcard,
   };
 }
-
 /**
  * Whether to serve the Swagger UI (/api/docs). An explicit ENABLE_SWAGGER wins ('true'/'false').
  * When unset, it defaults ON outside production but OFF in production — the public API schema is

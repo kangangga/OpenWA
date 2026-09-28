@@ -303,6 +303,7 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
       proxyUrl: dto.proxyUrl || null,
       proxyType: dto.proxyType || null,
       status: SessionStatus.CREATED,
+      branch_id: dto.branch_id || null,
     });
 
     // The findOne pre-check above is a fast path for the common case, but it's a check-then-insert

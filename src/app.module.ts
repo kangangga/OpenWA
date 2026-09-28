@@ -219,7 +219,7 @@ if (dashboardServingEnabled && dashboardBuildPresent) {
               // hanging requests. statement_timeout applies to the runtime pool only: the boot
               // migration chain runs on a separate pool built without it (pg-boot-migrations.ts),
               // so a long CREATE INDEX / backfill at boot is never aborted by it.
-              statement_timeout: configService.get<number>('dataDatabase.statementTimeoutMs', 30000),
+              // statement_timeout: configService.get<number>('dataDatabase.statementTimeoutMs', 30000),
               idleTimeoutMillis: configService.get<number>('dataDatabase.idleTimeoutMs', 30000),
               connectionTimeoutMillis: configService.get<number>('dataDatabase.connectionTimeoutMs', 10000),
               // Only set for a non-public schema (see above). `<schema>,public` keeps public on the

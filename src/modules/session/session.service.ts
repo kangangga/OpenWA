@@ -302,8 +302,8 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
       config: dto.config || {},
       proxyUrl: dto.proxyUrl || null,
       proxyType: dto.proxyType || null,
-      status: SessionStatus.CREATED,
       branch_id: dto.branch_id || null,
+      status: SessionStatus.CREATED,
     });
 
     // The findOne pre-check above is a fast path for the common case, but it's a check-then-insert
@@ -438,7 +438,9 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
     // update() with an explicit object rather than save() on the loaded entity: the entity carries
     // runtime-attached fields (lastError, restriction) that no column backs, and save() would try to
     // write the whole row back from a snapshot taken before this await.
-    await this.sessionRepository.update(id, { config: config as QueryDeepPartialEntity<Record<string, unknown>> });
+    await this.sessionRepository.update(id, {
+      config: config as QueryDeepPartialEntity<Record<string, unknown>>,
+    });
     return this.projectConfig(config);
   }
 

@@ -138,9 +138,9 @@ export class ChatMediaArchiveService implements OnModuleInit, OnModuleDestroy {
     // Same discriminator the send path and the export controller already apply to this value.
     if (MEDIA_URL_POINTER.test(media.data)) return null;
 
-    // const maxBytes = this.configService.get<number>('chatMedia.maxBytes', DEFAULT_ARCHIVE_MAX_BYTES);
-    // const sizeBytes = media.sizeBytes ?? Buffer.byteLength(media.data, 'base64');
-    // if (sizeBytes > maxBytes) return null;
+    const maxBytes = this.configService.get<number>('chatMedia.maxBytes', DEFAULT_ARCHIVE_MAX_BYTES);
+    const sizeBytes = media.sizeBytes ?? Buffer.byteLength(media.data, 'base64');
+    if (sizeBytes > maxBytes) return null;
 
     // A random key rather than the WhatsApp message id: message ids are engine-controlled strings
     // that can carry '/' (base64 id segments), which would silently nest the object and leak the

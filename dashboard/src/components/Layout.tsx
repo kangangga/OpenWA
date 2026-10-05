@@ -27,6 +27,7 @@ import { useRole, type UserRole } from '../hooks/useRole';
 import { languageOptions, resolveSupportedLanguage, rtlLanguages, type SupportedLanguage } from '../i18n';
 import { healthApi, infraApi } from '../services/api';
 import './Layout.css';
+import { useInfraLayout } from '../hooks/useInfraLayout';
 
 interface LayoutProps {
   onLogout: () => void;
@@ -56,6 +57,7 @@ export function Layout({ onLogout, userRole }: LayoutProps) {
   const { theme, toggleTheme } = useTheme();
   const ThemeIcon = themeIcons[theme];
   const themeLabel = t(`theme.${theme}`);
+  const layout = useInfraLayout();
   // toggleTheme cycles light, dark, system; the button names the state a click selects.
   const nextThemeLabel = t('theme.toggleTo', {
     value: t(`theme.${theme === 'light' ? 'dark' : theme === 'dark' ? 'system' : 'light'}`),
@@ -171,7 +173,7 @@ export function Layout({ onLogout, userRole }: LayoutProps) {
             {isMobileOpen ? <X size={24} /> : <Menu size={24} />}
           </button>
           <div className="mobile-brand">
-            <img src="/openwa_logo.webp" alt="OpenWA" className="sidebar-logo" />
+            <img src={layout?.brand.iconUrl} alt={layout?.brand.name} className="sidebar-logo" />
             <span className="brand-name">{t('common.appName')}</span>
           </div>
           <div style={{ width: 40 }} />
@@ -184,7 +186,7 @@ export function Layout({ onLogout, userRole }: LayoutProps) {
         className={`sidebar ${isCollapsed ? 'collapsed' : ''} ${isMobile ? 'mobile' : ''} ${isMobileOpen ? 'open' : ''}`}
       >
         <div className="sidebar-header">
-          <img src="/openwa_logo.webp" alt="OpenWA" className="sidebar-logo" />
+          <img src={layout?.brand.iconUrl} alt={layout?.brand.name} className="sidebar-logo" />
           {!isCollapsed && (
             <div className="sidebar-brand">
               <span className="brand-name">{t('common.appName')}</span>

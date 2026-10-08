@@ -703,13 +703,13 @@ curl -H "X-API-Key: $API_KEY" \
 
 **Common Causes:**
 
-| Cause                            | Symptom                                                         | Solution                                                                          |
-| -------------------------------- | --------------------------------------------------------------- | --------------------------------------------------------------------------------- |
-| Invalid phone number             | 400 error                                                       | Format: `628123456789@c.us`                                                       |
-| Rate limited                     | 429 error                                                       | Reduce sending rate                                                               |
-| Session not started or not ready | 400 (`is not active`) or 409                                    | Start or reconnect the session                                                    |
-| Media too large                  | 413 error                                                       | Compress or reduce size                                                           |
-| Number not on WhatsApp           | 400 on whatsapp-web.js; Baileys may accept it and never deliver | Verify the number first (`GET /api/sessions/{sessionId}/contacts/check/{number}`) |
+| Cause                            | Symptom                                                  | Solution                                                                          |
+| -------------------------------- | -------------------------------------------------------- | --------------------------------------------------------------------------------- |
+| Invalid phone number             | 400 error                                                | Format: `628123456789@c.us`                                                       |
+| Rate limited                     | 429 error                                                | Reduce sending rate                                                               |
+| Session not started or not ready | 400 (`is not active`) or 409                             | Start or reconnect the session                                                    |
+| Media too large                  | 413 error                                                | Compress or reduce size                                                           |
+| Number not on WhatsApp           | 400 when the recipient lookup reports it as unregistered | Verify the number first (`GET /api/sessions/{sessionId}/contacts/check/{number}`) |
 
 **Phone Number Validation:**
 
@@ -1167,8 +1167,9 @@ npm run migration:run:main:prod   # inside the released image
 By default the entrypoint starts as root, re-owns `/app/data` to the `openwa` user (uid/gid 997) on
 every start, and then drops privileges with `gosu`. Keep that path intact:
 
-- Keep the `CHOWN`, `DAC_OVERRIDE`, `FOWNER`, `SETGID` and `SETUID` entries under `cap_add` in
-  `docker-compose.yml`; the `chown` and the `gosu` drop need them.
+- Keep the `CHOWN`, `DAC_OVERRIDE`, `FOWNER`, `KILL`, `SETGID` and `SETUID` entries under `cap_add` in
+  `docker-compose.yml`; the entrypoint needs ownership and privilege-drop permissions, and
+  `dumb-init` needs `KILL` to forward shutdown signals to the process after its UID changes.
 - Setting `user:` on `openwa-api` (or `--user` on `docker run`) starts the entrypoint as that uid
   instead. It then skips the `chown` and the drop, so `/app/data` must already be writable by that
   uid: `user: "997:997"` works on a volume a root start has already re-owned, and the `cap_add` list

@@ -5247,6 +5247,51 @@ describe('votePoll', () => {
     const adapter = ready(chatWith([]));
     await expect(adapter.votePoll('628@c.us', 'OLD', ['x'])).rejects.toBeInstanceOf(MessageNotFoundError);
   });
+
+  describe('option texts checked against the poll', () => {
+    const poll = (vote: jest.Mock) => ({
+      id: { _serialized: 'P1' },
+      pollOptions: [
+        { name: 'Pizza', localId: 0 },
+        { name: 'Sushi', localId: 1 },
+      ],
+      vote,
+    });
+
+    it('refuses options that match none of the poll texts with 400, never sending the empty vote', async () => {
+      // vote() would send an empty selection here, which clears the account's vote, while the route
+      // answered 200 (the hidden defect behind #1738).
+      const vote = jest.fn().mockResolvedValue(undefined);
+      const adapter = ready(chatWith([poll(vote)]));
+
+      const err = await adapter.votePoll('628@c.us', 'P1', ['pizza', 'Burger']).catch((e: unknown) => e);
+
+      expect(err).toBeInstanceOf(BadRequestException);
+      expect((err as BadRequestException).getResponse()).toEqual(
+        expect.objectContaining({ code: 'POLL_OPTION_NOT_FOUND', validOptions: ['Pizza', 'Sushi'] }),
+      );
+      expect((err as Error).message).toMatch(/"Pizza", "Sushi"/);
+      expect(vote).not.toHaveBeenCalled();
+    });
+
+    it('still votes when at least one text matches, as before', async () => {
+      const vote = jest.fn().mockResolvedValue(undefined);
+      const adapter = ready(chatWith([poll(vote)]));
+
+      await adapter.votePoll('628@c.us', 'P1', ['Pizza', 'Burger']);
+
+      expect(vote).toHaveBeenCalledWith(['Pizza', 'Burger']);
+    });
+
+    it('keeps an explicit empty array as a deliberate clear', async () => {
+      const vote = jest.fn().mockResolvedValue(undefined);
+      const adapter = ready(chatWith([poll(vote)]));
+
+      await adapter.votePoll('628@c.us', 'P1', []);
+
+      expect(vote).toHaveBeenCalledWith([]);
+    });
+  });
 });
 
 describe('pinMessage / unpinMessage', () => {
@@ -5702,7 +5747,23 @@ describe('WhatsAppWebJsAdapter message_ack (unreadable id)', () => {
 
     client.emit('message_ack', { id: { _serialized: 'ACKED_MSG' } }, 3);
 
-    expect(onMessageAck).toHaveBeenCalledWith('ACKED_MSG', expect.any(String));
+    expect(onMessageAck).toHaveBeenCalledWith('ACKED_MSG', expect.any(String), undefined);
+  });
+
+  it('derives the acked message chat as Message._getChatId does', () => {
+    // Acks ride outbound messages, so the chat is the recipient; the direction flag keeps an
+    // inbound-shaped payload on its sender, the same derivation the revoked handler uses.
+    const { onMessageAck, client } = wireAckHandler();
+
+    client.emit(
+      'message_ack',
+      { id: { _serialized: 'ACKED_OUT' }, fromMe: true, from: 'me@c.us', to: '120363000@g.us' },
+      3,
+    );
+    client.emit('message_ack', { id: { _serialized: 'ACKED_IN' }, fromMe: false, from: '621@c.us', to: 'me@c.us' }, 2);
+
+    expect(onMessageAck).toHaveBeenCalledWith('ACKED_OUT', expect.any(String), '120363000@g.us');
+    expect(onMessageAck).toHaveBeenCalledWith('ACKED_IN', expect.any(String), '621@c.us');
   });
 
   it('reads a renamed `$1` id when the dependency has not normalized it', () => {
@@ -5712,7 +5773,7 @@ describe('WhatsAppWebJsAdapter message_ack (unreadable id)', () => {
 
     client.emit('message_ack', { id: { $1: 'ACKED_RENAMED' } }, 3);
 
-    expect(onMessageAck).toHaveBeenCalledWith('ACKED_RENAMED', expect.any(String));
+    expect(onMessageAck).toHaveBeenCalledWith('ACKED_RENAMED', expect.any(String), undefined);
   });
 
   it('drops an ack whose id cannot be read instead of passing undefined on', () => {
@@ -8643,12 +8704,17 @@ describe('WhatsAppWebJsAdapter raw-id extraction hardening', () => {
   it('getChatsByLabel skips an undefined entry (deleted chat behind the label) instead of a 500', async () => {
     const getChatsByLabelId = jest
       .fn()
-      .mockResolvedValue([undefined, { id: { _serialized: '628111@c.us' }, name: 'Kept', isGroup: false }, { id: {} }]);
+      .mockResolvedValue([
+        undefined,
+        { id: { _serialized: '628111@c.us' }, name: 'Kept', isGroup: false, lastMessage: { type: 'image' } },
+        { id: {} },
+      ]);
 
     const result = await readyAdapter({ getChatsByLabelId }).getChatsByLabel('7');
 
     expect(result).toHaveLength(1);
     expect(result[0].id).toBe('628111@c.us');
+    expect(result[0].lastMessageType).toBe('image');
   });
 
   // getNumberId returns a raw page-context Wid; on a WA Web build that renamed _serialized to $1,

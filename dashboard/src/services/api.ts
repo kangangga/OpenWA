@@ -255,6 +255,7 @@ export interface Chat {
   unreadCount: number;
   timestamp: number;
   lastMessage?: string;
+  lastMessageType?: MessageType;
   archived: boolean;
   pinned: boolean;
   muted: boolean;
@@ -316,7 +317,16 @@ export interface ChatMessage {
   timestamp?: number;
   createdAt: string;
   metadata?: {
-    media?: { mimetype: string; filename?: string; data?: string; omitted?: boolean; sizeBytes?: number };
+    poll?: { name: string; options: string[]; allowMultipleAnswers: boolean };
+    media?: {
+      mimetype: string;
+      filename?: string;
+      data?: string;
+      omitted?: boolean;
+      sizeBytes?: number;
+      /** With `omitted`: the inline copy was dropped because the chat-media archive holds the bytes. */
+      archived?: boolean;
+    };
     quotedMessage?: { id: string; body: string };
     reactions?: Record<string, string>;
     call?: { video: boolean; missed: boolean };
@@ -378,7 +388,9 @@ export interface EngineHistoryMessage {
     data?: string;
     omitted?: boolean;
     sizeBytes?: number;
+    archived?: boolean;
   };
+  poll?: { name: string; options: string[]; allowMultipleAnswers: boolean };
   quotedMessage?: { id: string; body: string };
   location?: { latitude: number; longitude: number; description?: string; address?: string; url?: string };
   /** Present on `order` messages only: the placed cart, plus the single-order token for its items. */
@@ -797,7 +809,7 @@ async function requestText(endpoint: string): Promise<string> {
 }
 
 /** Like {@link request} but returns a Blob — e.g. for status media downloads. */
-async function requestBlob(endpoint: string): Promise<Blob> {
+async function requestBlob(endpoint: string, signal?: AbortSignal): Promise<Blob> {
   const url = `${API_BASE_URL}${endpoint}`;
 
   // Get API key from sessionStorage for authentication
@@ -807,7 +819,7 @@ async function requestBlob(endpoint: string): Promise<Blob> {
     ...(apiKey ? { 'X-API-Key': apiKey } : {}),
   };
 
-  const response = await fetch(url, { headers });
+  const response = await fetch(url, { headers, signal });
 
   if (!response.ok) {
     return handleErrorResponse<Blob>(response);
@@ -886,8 +898,11 @@ export const sessionApi = {
   // MESSAGE_LIST_INLINE_MEDIA_BUDGET_BYTES; past that budget the payload arrives as the
   // `{ omitted: true, sizeBytes }` marker and the bytes are only reachable here. Served as an
   // attachment (Content-Disposition), so callers download it rather than rendering it inline.
-  getMessageMediaBlob: (id: string, chatId: string, messageId: string) =>
-    requestBlob(`/sessions/${id}/messages/${encodeURIComponent(chatId)}/${encodeURIComponent(messageId)}/media`),
+  getMessageMediaBlob: (id: string, chatId: string, messageId: string, signal?: AbortSignal) =>
+    requestBlob(
+      `/sessions/${id}/messages/${encodeURIComponent(chatId)}/${encodeURIComponent(messageId)}/media`,
+      signal,
+    ),
   getSubscribedChannels: (id: string) => request<Channel[]>(`/sessions/${id}/channels`),
   getChannelMessages: (id: string, channelId: string, limit = 50) =>
     request<ChannelMessage[]>(`/sessions/${id}/channels/${encodeURIComponent(channelId)}/messages?limit=${limit}`),

@@ -7,6 +7,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Allow chat-restricted API keys to subscribe to chat WebSocket events.
+- Allow chat-restricted MCP keys to read and send within their chat allowlist using the REST authorization rules.
+- Carry `chatId` in `message.ack` and `message.failed` payloads so a webhook `chatId` filter scopes delivery events per chat.
+- Filter stored messages by time, direction, type or message reference, with stable message-time pagination.
+- Scope built-in message search and group detail/settings to a chat-restricted key's allowed chats; reject plugin search for these keys.
+- Expose poll choices and selection mode in message events, stored messages, history, and dashboard chats.
+- Expose optional last-message types in chat lists and SDKs.
+- Add bounded webhook failure redrive with optional payload retention.
+- Expose caller-supplied send idempotency keys in all five SDKs.
+- Add optional 24-hour idempotency keys to twelve single-recipient send routes.
+
+- Add opt-in archive-only chat media with dashboard previews.
+
+### Fixed
+
+- Deliver Baileys API edit and revoke events to webhook and WebSocket consumers.
+- Preserve chat-scoped WebSocket event order while resolving chat identities.
+- Preserve poll choices across dashboard echoes and keep revoked messages cleared.
+- Serialize explicitly selected empty Go redrive slices as empty arrays.
+- Emit Baileys API reaction updates, including reaction removal.
+- Restore legacy webhook failures and normalize terminal duplicates before SQLite schema synchronization.
+- Exclude retained webhook replay payloads from database backup reads.
+- Advance webhook recovery scans past live queued deliveries.
+- Apply current receiver configuration and session ownership to every webhook delivery attempt.
+- Clear revoked Baileys history messages from storage, previews, quoted replies, and plugin indexes.
+- Preserve pending message mutations when REST storage wins an own-send echo.
+- Cancel archived media preview downloads when their components unmount.
+- Refresh Baileys pairing secrets and prevent stale QR renders during linking.
+- Upgrade proxy-addr to 2.0.8 to correct IPv4-mapped IPv6 proxy trust matching.
+- Upgrade source-map-js to 1.2.2 to validate indexed source-map offsets.
+- Fix Baileys first-contact addresses and reject phone numbers reported as unregistered before sending.
+- Release send idempotency keys when transport explicitly reports that nothing was sent.
+- Preserve archived media and reactions during concurrent metadata updates.
+- Keep sent media when merging onto an echo row fails.
+- Keep inline media when its WhatsApp message ID is unavailable.
+- Enforce chat media size limits using decoded payload bytes.
+- Bound archived dashboard previews alongside inline media.
+- Preserve the Java failure constructor and empty Go redrive filters.
+- Keep narrow chat panes scrollable and prevent message actions from shrinking previews.
+- Open archived images in the dashboard media viewer without fetching them again.
+- Forward container shutdown signals after dropping process privileges in Compose and Helm.
+- Preserve webhook outbox payloads until delivery or durable failure storage succeeds.
+- Enforce webhook replay retention and keep later eligible failures moving through batches.
+- Keep one terminal webhook failure per receiver idempotency key.
+- Retain send idempotency keys after engine-stage failures, including HTTP 409.
+- Reject poll votes with no matching options while preserving explicit vote clearing.
+
 ## [0.24.0] - 2026-10-03
 
 ### Added

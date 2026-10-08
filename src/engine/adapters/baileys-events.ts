@@ -9,6 +9,7 @@ import {
   PresenceState,
   CallOutcome,
   IncomingMessage,
+  MessageType,
   ReactionEvent,
   RevokedMessage,
 } from '../interfaces/whatsapp-engine.interface';
@@ -20,6 +21,7 @@ import {
   extractBaileysButtonReply,
   extractBaileysButtons,
   extractBaileysCommerce,
+  extractBaileysPoll,
   extractBaileysContext,
   extractBaileysLocation,
   isBaileysCatalogShare,
@@ -173,9 +175,9 @@ export interface BaileysEventsHost {
   /** Learn any lid->pn pair a message key carries (also writes through to the persistent table). */
   recordKeyLidMappings(key: Pick<WAMessageKey, 'remoteJid' | 'remoteJidAlt' | 'participant' | 'participantAlt'>): void;
   /** Seed the chat's last-message preview + sort time from an inbound message. */
-  recordMessage(msg: WAMessage): void;
+  recordMessage(msg: WAMessage, type?: MessageType): void;
   /** Apply a message edit to the stored body. */
-  recordMessageEdit(chatId: string, messageId: string, text: string): void;
+  recordMessageEdit(chatId: string, messageId: string, text: string, type?: MessageType): void;
   /** Persist an inbound message to the store; undefined when no store is configured. */
   putStoredMessage(msg: WAMessage): Promise<void> | undefined;
   /** Rewrite a stored message in place (see BaileysMessageStore.update); undefined without a store. */
@@ -300,6 +302,21 @@ export class BaileysEvents {
       const [oldest] = this.deletedForEveryone;
       this.deletedForEveryone.delete(oldest);
     }
+  }
+
+  /** Apply a history delete to the raw cache without announcing a live message event. */
+  async applyHistoryRevoke(target: WAMessageKey, envelope: WAMessageKey): Promise<WAMessageKey | undefined> {
+    if (!target.id) return undefined;
+    const generation = this.storeGeneration;
+    const stored = await this.readStoredMessage(target.id, 'checking what a history revoke targets');
+    if (generation !== this.storeGeneration) return undefined;
+    const original = stored?.key ?? this.inboundInFlight.get(target.id)?.key ?? target;
+    if (!this.mayChange(original, envelope, true)) return undefined;
+    if (stored || this.inboundInFlight.has(target.id)) this.markDeletedForEveryone(target.id);
+    this.changeStoredMessage(target.id, copy =>
+      this.mayChange(copy.key, envelope, true) ? { ...copy, message: null } : null,
+    );
+    return original;
   }
 
   handleMessagesUpsert(event: { messages: WAMessage[]; type: string }): void {
@@ -446,7 +463,7 @@ export class BaileysEvents {
             body: '',
             timestamp: toUnixSeconds(msg.messageTimestamp),
           };
-          this.host.recordMessageEdit(chatJid, revoked.id, '');
+          this.host.recordMessageEdit(chatJid, revoked.id, '', 'revoked');
           // While the target is still being processed, the store change waits for it and lands after
           // this delete is announced, and a repeat delivery may already hold the content in the store:
           // record the delete now, checked against the target's own key.
@@ -635,9 +652,9 @@ export class BaileysEvents {
           this.host.getOnMessage()?.(incoming);
         }
       }
-      this.host.recordMessage(msg);
+      this.host.recordMessage(msg, incoming.type);
       if (deleted) {
-        this.host.recordMessageEdit(chatJid, storedId, '');
+        this.host.recordMessageEdit(chatJid, storedId, '', 'revoked');
       } else if (editedBody !== undefined && storedId !== null) {
         this.host.recordMessageEdit(chatJid, storedId, editedBody);
       }
@@ -767,11 +784,16 @@ export class BaileysEvents {
     return (isDelete && inGroup) || overlap(author(target), author(envelope));
   }
 
-  handleMessagesUpdate(updates: Array<{ key?: { id?: string | null }; update?: { status?: number | null } }>): void {
+  handleMessagesUpdate(
+    updates: Array<{ key?: { id?: string | null; remoteJid?: string | null }; update?: { status?: number | null } }>,
+  ): void {
     for (const u of updates) {
       const status = mapBaileysStatus(u.update?.status);
       if (status && u.key?.id) {
-        this.host.getOnMessageAck()?.(u.key.id, status);
+        // Canonicalize the update's chat exactly as the inbound mapper does, so an ack's chatId
+        // matches the chatId of the message events it accompanies.
+        const chatId = u.key.remoteJid ? this.host.toNeutralJid(u.key.remoteJid) : undefined;
+        this.host.getOnMessageAck()?.(u.key.id, status, chatId);
       }
     }
   }
@@ -1469,6 +1491,7 @@ export class BaileysEvents {
         quotedMessage: context.quotedMessage,
         order: commerce.order,
         product: commerce.product,
+        poll: extractBaileysPoll(normalized),
         button,
         buttons,
         isCatalogShare: isBaileysCatalogShare(normalized),

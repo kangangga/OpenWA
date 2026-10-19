@@ -43,6 +43,8 @@ import { EngineTransportError } from '../../common/errors/engine-transport.error
 import { EngineNotSentError } from '../../common/errors/engine-not-sent.error';
 import { parseWaId, userPart } from '../identity/wa-id';
 import { BAILEYS_QUERY_BUDGET_MS, withQueryDeadline } from './baileys-query-deadline';
+import { ConcurrencyLimiter } from '../../common/utils/concurrency-limiter';
+import { describeAudio } from './baileys-audio-probe';
 
 /**
  * Messaging-domain operations extracted from BaileysAdapter. The adapter keeps the public
@@ -137,6 +139,57 @@ export async function loadSharp() {
   }
 }
 
+/**
+ * Refuse SVG input process-wide. OpenWA never needs it, yet a sticker and the thumbnail of every outbound
+ * image hand caller-supplied bytes to sharp, which autodetects SVG and parses it with librsvg: a native
+ * decoder with a memory-safety record that is the largest attack surface on those two routes. The block is
+ * libvips state shared by every importer of sharp, Baileys included, so it has to be set before the first
+ * decode and not by the first sticker. Best effort: a sharp that cannot load has nothing to block, and the
+ * routes that need it report that themselves (see loadSharp).
+ */
+export async function blockSvgDecoding(): Promise<void> {
+  try {
+    (await import('sharp')).default.block({ operation: ['VipsForeignLoadSvg'] });
+  } catch {
+    // sharp could not load, so there is no decoder to block.
+  }
+}
+
+/**
+ * Refuse a picture the image decoder cannot read, before Baileys hands it to that decoder: its own
+ * conversion rejects such a file with an error nothing maps, which reached the client as a 500. An SVG is
+ * one since blockSvgDecoding, and so is a file that is no image at all. Only the header is read. A sharp
+ * that cannot load is left to the library, which reports that itself.
+ */
+export async function assertReadableImage(data: Buffer): Promise<void> {
+  const sharp = await import('sharp').then(
+    module => module.default,
+    () => undefined,
+  );
+  if (!sharp) return;
+  try {
+    await sharp(data).metadata();
+  } catch (error) {
+    throw new BadRequestException(
+      `The picture could not be read as an image (SVG is not accepted): ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+}
+
+/**
+ * Animation frames a sticker conversion accepts: a 10-second animation at 50 fps. Each frame is
+ * resized and encoded at 512x512 (a few ms apiece), so cost is linear in the frame count, and a
+ * GIF of 1x1 frames packs tens of thousands of them into well under a megabyte.
+ */
+export const MAX_STICKER_FRAMES = 500;
+
+/**
+ * Conversions running at once, process-wide. Each sharp call (the frame scan, then the pipeline)
+ * holds a libuv threadpool worker (4 by default) for its whole run, and that pool also serves fs,
+ * dns.lookup, crypto and zlib.
+ */
+const stickerConversions = new ConcurrencyLimiter(2);
+
 async function toWebpSticker(data: Buffer, mimetype: string): Promise<Buffer> {
   if (isWebpBuffer(data)) {
     return data;
@@ -156,11 +209,24 @@ async function toWebpSticker(data: Buffer, mimetype: string): Promise<Buffer> {
   // deferral the adapters already use for the engine libraries themselves.
   const sharp = await loadSharp();
   try {
-    return await sharp(data, { animated: true })
-      .resize(512, 512, { fit: 'contain', background: { r: 0, g: 0, b: 0, alpha: 0 } })
-      .webp()
-      .toBuffer();
+    const image = sharp(data, { animated: true });
+    return await stickerConversions.run(async () => {
+      // Counting frames only scans the file, so an oversized animation is refused before any decode.
+      // The scan still runs on the threadpool and grows faster than the frame count, so it holds the
+      // same slot as the pipeline.
+      const { pages = 1 } = await image.metadata();
+      if (pages > MAX_STICKER_FRAMES) {
+        throw new BadRequestException(
+          `The sticker animation has ${pages} frames; at most ${MAX_STICKER_FRAMES} can be converted.`,
+        );
+      }
+      return image
+        .resize(512, 512, { fit: 'contain', background: { r: 0, g: 0, b: 0, alpha: 0 } })
+        .webp()
+        .toBuffer();
+    });
   } catch (error) {
+    if (error instanceof BadRequestException) throw error;
     // Bytes that do not decode as the image they claim to be. Refuse before the socket rather than
     // ship them mislabelled — that is the whole point.
     throw new BadRequestException(
@@ -415,13 +481,16 @@ export class BaileysMessaging {
   async sendAudioMessage(chatId: string, media: MediaInput): Promise<MessageResult> {
     this.host.ensureReady();
     const { data, mimetype } = await resolveMediaBuffer(media, this.host.sessionProxyUrl(), 'audio/mpeg');
+    const ptt = media.ptt ?? false;
     return this.sendContent(
       chatId,
       // Audio carries no caption, so a mention here tags the recipient through contextInfo without
       // visible @text. It is still forwarded: the route accepts `mentions` (SendAudioMessageDto
       // extends SendMediaMessageDto) and whatsapp-web.js sends it, so dropping it here made the same
       // request notify participants on one engine and silently not on the other.
-      { audio: data, mimetype, ptt: media.ptt ?? false, ...this.withMentions(media.mentions) },
+      // The duration and a voice note's waveform come from describeAudio, never from Baileys, which
+      // would read the file in this process.
+      { audio: data, mimetype, ptt, ...(await describeAudio(data, ptt)), ...this.withMentions(media.mentions) },
       await this.quoteOption(media.quotedMessageId),
     );
   }

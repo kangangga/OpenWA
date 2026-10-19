@@ -162,6 +162,26 @@ describe('BuiltInFtsProvider (sqlite)', () => {
     expect((await provider.search({ q: 'hello', chatIds: ['c2'], sessionIds: ['s1'] })).total).toBe(0);
   });
 
+  // bm25 weighs a term by how many messages the whole index holds, so the rank of a hit a session- or
+  // chat-scoped caller may read still reflects sessions and chats it may not. The hits stay ordered by it;
+  // the value is withheld.
+  it('returns no score to a session- or chat-scoped caller, and still returns one to an unscoped key', async () => {
+    const unscoped = await provider.search({ q: 'hello' });
+    expect(unscoped.hits.map(hit => typeof hit.score)).toEqual(['number', 'number']);
+
+    const chats = await provider.search({ q: 'hello', chatIds: ['c2'] });
+    expect(chats.hits.map(hit => hit.chatId)).toEqual(['c2']);
+    expect(chats.hits[0].score).toBeUndefined();
+
+    const sessions = await provider.search({ q: 'hello', sessionIds: ['s1'] });
+    expect(sessions.hits.map(hit => hit.sessionId)).toEqual(['s1']);
+    expect(sessions.hits[0].score).toBeUndefined();
+
+    // A key stored with an empty session list is unrestricted: it searches every session and keeps its score.
+    const everySession = await provider.search({ q: 'hello', sessionIds: [] });
+    expect(everySession.hits.map(hit => typeof hit.score)).toEqual(['number', 'number']);
+  });
+
   it.each([0, 1])('returns no hits or count for an empty compiled chat scope at offset %s', async offset => {
     const result = await provider.search({ q: 'hello', chatIds: [], limit: 1, offset });
     expect(result.hits).toEqual([]);
@@ -185,6 +205,17 @@ describe('BuiltInFtsProvider (sqlite)', () => {
     for (const q of ['"unbalanced', '*foo', '(test', '262813461250071@lid', 'a@c.us']) {
       await expect(provider.search({ q })).resolves.toMatchObject({ provider: 'builtin-fts' });
     }
+  });
+
+  it('runs a repeated word once, since a repeat adds nothing under AND but costs a pass per match', async () => {
+    const query = jest.spyOn(ds, 'query');
+    const repeated = await provider.search({ q: Array.from({ length: 200 }, () => 'hello').join(' ') });
+    const single = await provider.search({ q: 'hello' });
+
+    const matched = query.mock.calls.filter(([sql]) => String(sql).includes('MATCH')).map(([, params]) => params);
+    expect((matched[0] as unknown[])[0]).toBe('"hello"');
+    expect((matched[1] as unknown[])[0]).toBe('"hello"');
+    expect(repeated.hits.map(h => h.messageId)).toEqual(single.hits.map(h => h.messageId));
   });
 
   it('keeps multi-token AND semantics after quoting', async () => {
@@ -218,6 +249,40 @@ describe('BuiltInFtsProvider (sqlite)', () => {
 
     const excluded = await provider.search({ q: 'datefilter', dateFrom: (tsSeconds + 1) * 1000 });
     expect(excluded.hits).toEqual([]);
+  });
+
+  it('applies inclusive millisecond windows to rows and paginated totals', async () => {
+    await ds.getRepository(Message).insert(
+      [-2, -1, 0, 1, 2, 1_700_000_000, 1_700_000_001].map(timestamp => ({
+        sessionId: 's1',
+        chatId: 'c1',
+        from: 'a@c.us',
+        to: 'dest@c.us',
+        body: 'boundarywindow',
+        type: 'text',
+        direction: MessageDirection.OUTGOING,
+        timestamp,
+      })),
+    );
+    const windows = [
+      { dateFrom: 1000, dateTo: 2000, want: [2, 1] },
+      { dateFrom: 1001, dateTo: 1999, want: [] },
+      { dateFrom: 0, dateTo: 0, want: [0] },
+      { dateFrom: -1999, dateTo: -1, want: [-1] },
+      { dateFrom: -2000, dateTo: -1001, want: [-2] },
+      { dateFrom: 0.5, dateTo: 1999.5, want: [1] },
+      { dateFrom: 1000, dateTo: 1000, want: [1] },
+      { dateFrom: 2000, dateTo: 1000, want: [] },
+      { dateFrom: 1_700_000_000_001, dateTo: 1_700_000_001_000, want: [1_700_000_001] },
+    ];
+    for (const { want, ...bounds } of windows) {
+      const result = await provider.search({ q: 'boundarywindow', ...bounds });
+      expect(result.hits.map(hit => hit.timestamp)).toEqual(want);
+      expect(result.total).toBe(want.length);
+      const page = await provider.search({ q: 'boundarywindow', ...bounds, limit: 1, offset: 1 });
+      expect(page.hits.map(hit => hit.timestamp)).toEqual(want.slice(1, 2));
+      expect(page.total).toBe(want.length);
+    }
   });
 
   it('the FTS UPDATE trigger carries a WHEN body-change guard (not fire on ack-only updates)', async () => {

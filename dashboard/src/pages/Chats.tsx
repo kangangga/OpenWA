@@ -313,6 +313,7 @@ export function Chats() {
   // answer is dropped only once a newer one has landed: dropping every answer a newer call overtook
   // left a burst of realtime refetches with no list at all, each miss firing the next refetch.
   // A realtime refetch runs in the background, keeping the current list on screen.
+  const chatsLoadsRef = useRef(new Set<AbortController>());
   const chatsRequestRef = useRef(0);
   const chatsAppliedRef = useRef(0);
   const chatsSessionRef = useRef('');
@@ -324,15 +325,18 @@ export function Chats() {
   const loadChats = useCallback(
     async (sessionId: string, { background = false } = {}): Promise<boolean> => {
       if (!sessionId) return false;
+      const controller = new AbortController();
+      chatsLoadsRef.current.add(controller);
       const request = ++chatsRequestRef.current;
       chatsSessionRef.current = sessionId;
-      const stale = () => sessionId !== chatsSessionRef.current || request < chatsAppliedRef.current;
+      const stale = () =>
+        controller.signal.aborted || sessionId !== chatsSessionRef.current || request < chatsAppliedRef.current;
       // A stale answer for the session still selected was overtaken by a newer list that has applied,
       // so this session's list on screen is as fresh as this call's would have been.
-      const overtaken = () => sessionId === chatsSessionRef.current;
+      const overtaken = () => !controller.signal.aborted && sessionId === chatsSessionRef.current;
       try {
         if (!background) setLoadingChats(true);
-        const data = await sessionApi.getChats(sessionId);
+        const data = await sessionApi.getChats(sessionId, controller.signal);
         if (stale()) return overtaken();
         chatsAppliedRef.current = request;
         // A live frame can move a row past the snapshot a background refetch was built from while it is
@@ -342,7 +346,9 @@ export function Chats() {
         listedSessionRef.current = sessionId;
         setChats(prev => {
           const live = new Map(merge ? prev.map(c => [c.id, c] as const) : []);
-          return data
+          const fetchedIds = new Set(data.map(c => c.id));
+          const rows = [...data, ...prev.filter(c => merge && moved(c.id) && !fetchedIds.has(c.id))];
+          return rows
             .map(c => {
               const row = live.get(c.id);
               return row && moved(c.id) && (row.timestamp || 0) > (c.timestamp || 0) ? row : c;
@@ -359,9 +365,10 @@ export function Chats() {
         setChats([]);
         return false;
       } finally {
+        chatsLoadsRef.current.delete(controller);
         // Only the call that raised the spinner clears it: a background refetch settling first would
         // otherwise uncover the previous session's list while the switch's own load is still out.
-        if (!background && sessionId === chatsSessionRef.current) setLoadingChats(false);
+        if (!background && !controller.signal.aborted && sessionId === chatsSessionRef.current) setLoadingChats(false);
       }
     },
     [showLoadError],
@@ -376,6 +383,7 @@ export function Chats() {
   }, []);
 
   useEffect(() => {
+    const loads = chatsLoadsRef.current;
     if (selectedSessionId) {
       void loadChats(selectedSessionId);
       setActiveChat(null);
@@ -390,6 +398,10 @@ export function Chats() {
       setReplyingTo(null);
       lastRoomIdRef.current = null;
     }
+    return () => {
+      for (const controller of loads) controller.abort();
+      loads.clear();
+    };
   }, [selectedSessionId, loadChats]);
 
   // Coalesce mark-as-read RPCs per chat: every incoming message in the visible chat raises a
@@ -409,15 +421,25 @@ export function Chats() {
   // fire-and-forget (a failure only raises a warning toast), so firing on the way out is safe —
   // and dropping the pending call would leave the last messages of a quickly-exited chat unread.
   // The flush closure still references the PREVIOUS session on a session switch, which is exactly
-  // where those queued reads belong.
-  useEffect(() => () => markReadCoalescer.flush(), [markReadCoalescer]);
+  // where those queued reads belong. Logout removes the key before the page unmounts, though: a
+  // read flushed then goes out keyless and its 401 reloads the login form, so drop it instead.
+  useEffect(
+    () => () => {
+      if (sessionStorage.getItem('openwa_api_key')) markReadCoalescer.flush();
+      else markReadCoalescer.cancel();
+    },
+    [markReadCoalescer],
+  );
 
   // Marking a chat read is an operator write; a read-only key would only collect 403 toasts.
+  // A session switch rebuilds the coalescer for the new session one render before the open chat is
+  // cleared, so until the new session's list is on screen the open chat is still the previous
+  // account's and nothing is marked read.
   const markChatRead = useCallback(
     (chatId: string) => {
-      if (canWrite) markReadCoalescer.call(chatId);
+      if (canWrite && listedSessionRef.current === selectedSessionId) markReadCoalescer.call(chatId);
     },
-    [markReadCoalescer, canWrite],
+    [markReadCoalescer, canWrite, selectedSessionId],
   );
 
   // 3. WebSocket integration for real-time messages
@@ -706,7 +728,7 @@ export function Chats() {
   // The threads cache at staleTime: Infinity, and this session's events were not delivered while
   // another session was selected or the page was away. Mark them stale on a mount or a session switch
   // so the open one refetches and the others do when opened, with or without a live feed (a
-  // chat-scoped key is refused one).
+  // chat-restricted key gets only its chats' message events).
   useEffect(() => {
     if (selectedSessionId) void queryClient.invalidateQueries({ queryKey: ['messages', selectedSessionId] });
   }, [selectedSessionId, queryClient]);

@@ -926,11 +926,12 @@ export interface SetProfilePictureRequest {
 
 // ── Webhook ───────────────────────────────────────────────────────
 
-/** Events a webhook may subscribe to. Use `*` to receive all. */
+/** Events a webhook may subscribe to. Use `*` to receive all except `message.receipt`, which must be named. */
 export type WebhookEvent =
   | 'message.received'
   | 'message.sent'
   | 'message.ack'
+  | 'message.receipt'
   | 'message.failed'
   | 'message.revoked'
   | 'message.reaction'
@@ -942,6 +943,7 @@ export type WebhookEvent =
   | 'session.reconnect_loop'
   | 'session.restriction'
   | 'presence.update'
+  | 'event.response'
   | 'call.accepted'
   | 'call.rejected'
   | 'call.missed'

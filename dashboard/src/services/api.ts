@@ -740,15 +740,24 @@ export interface SearchResults {
 // fails; the never-settling promise halts this request's chain so callers neither flash a generic
 // error toast nor receive an undefined payload while the page navigates away. Otherwise throw an
 // Error carrying the HTTP status and, when the gateway supplied one, its machine code.
-async function handleErrorResponse<T>(response: Response): Promise<T> {
+// `sentKey` is the key the request carried (null when none). Logout aborts nothing in flight, so an
+// answer can arrive after the stored key changed. With a key sent but none stored, a sign-out is
+// already under way (an earlier failure of the same burst, or the user on the login form): stay
+// silent and do not navigate again. A request sent without a key comes only from a chain that
+// outlived a logout (the dashboard shows the login form whenever no key is stored), so with none
+// stored it stays silent too rather than reloading the login form under the user. With another key
+// stored, the answer speaks for a key no longer in use and must not sign out the current one, so it
+// fails like any other error.
+async function handleErrorResponse<T>(response: Response, sentKey: string | null): Promise<T> {
   // On a non-JSON body (e.g. a reverse-proxy 502/503/504 HTML page) fall through to `HTTP <status>`
   // rather than statusText: the toast folds an exact `HTTP 502`/`HTTP 503` into its connection-lost
   // toast (a 504 keeps its own), and statusText is empty over HTTP/2 anyway.
   const error = await response.json().catch(() => ({}));
-  if (isKeyUnusable(response.status, error.message)) {
+  const storedKey = sessionStorage.getItem('openwa_api_key');
+  if (isKeyUnusable(response.status, error.message) && (storedKey === sentKey || storedKey === null)) {
     sessionStorage.removeItem('openwa_api_key');
     if (typeof window !== 'undefined') {
-      window.location.assign('/');
+      if (sentKey !== null && storedKey === sentKey) window.location.assign('/');
       return new Promise<T>(() => {});
     }
   }
@@ -784,7 +793,7 @@ async function request<T>(endpoint: string, options: RequestInit = {}): Promise<
   const response = await fetch(url, { ...options, headers });
 
   if (!response.ok) {
-    return handleErrorResponse<T>(response);
+    return handleErrorResponse<T>(response, apiKey);
   }
 
   if (response.status === 204) {
@@ -802,7 +811,7 @@ async function requestText(endpoint: string): Promise<string> {
   });
 
   if (!response.ok) {
-    return handleErrorResponse<string>(response);
+    return handleErrorResponse<string>(response, apiKey);
   }
 
   return response.text();
@@ -822,7 +831,7 @@ async function requestBlob(endpoint: string, signal?: AbortSignal): Promise<Blob
   const response = await fetch(url, { headers, signal });
 
   if (!response.ok) {
-    return handleErrorResponse<Blob>(response);
+    return handleErrorResponse<Blob>(response, apiKey);
   }
 
   return response.blob();
@@ -870,7 +879,32 @@ export const sessionApi = {
   getStats: () => request<SessionStats>('/sessions/stats/overview'),
   getGroups: (id: string) =>
     request<{ id: string; name?: string; linkedParentJID?: string | null }[]>(`/sessions/${id}/groups`),
-  getChats: (id: string) => request<Chat[]>(`/sessions/${id}/chats`),
+  getChats: async (id: string, signal?: AbortSignal) => {
+    let lastError: unknown;
+    const { items, throttled } = await fetchAllPages<Chat>(
+      async (limit, offset) => {
+        signal?.throwIfAborted();
+        try {
+          const data = await request<Chat[]>(`/sessions/${id}/chats?limit=${limit}&offset=${offset}`, { signal });
+          return { data, total: data.length < limit ? offset + data.length : Infinity };
+        } catch (err) {
+          lastError = err;
+          throw err;
+        } finally {
+          signal?.throwIfAborted();
+        }
+      },
+      { pageSize: 1000, maxItems: Infinity },
+    );
+    // A later throttled page must fail the load rather than present an incomplete sidebar.
+    if (throttled) throw lastError;
+    const seen = new Set<string>();
+    return items.filter(chat => {
+      if (seen.has(chat.id)) return false;
+      seen.add(chat.id);
+      return true;
+    });
+  },
   markChatRead: (id: string, chatId: string) =>
     request<{ success: boolean }>(`/sessions/${id}/chats/read`, {
       method: 'POST',
@@ -907,8 +941,8 @@ export const sessionApi = {
   getChannelMessages: (id: string, channelId: string, limit = 50) =>
     request<ChannelMessage[]>(`/sessions/${id}/channels/${encodeURIComponent(channelId)}/messages?limit=${limit}`),
   getContactStatuses: (id: string) => request<{ statuses: StatusUpdate[] }>(`/sessions/${id}/status`),
-  getStatusMediaBlob: (id: string, statusId: string) =>
-    requestBlob(`/sessions/${id}/status/${encodeURIComponent(statusId)}/media`),
+  getStatusMediaBlob: (id: string, statusId: string, signal?: AbortSignal) =>
+    requestBlob(`/sessions/${id}/status/${encodeURIComponent(statusId)}/media`, signal),
   postTextStatus: (
     id: string,
     text: string,
@@ -1233,7 +1267,7 @@ export const infraApi = {
       body: JSON.stringify({ profiles: profiles || [], profilesToRemove: profilesToRemove || [] }),
     }),
   // Readiness, not the plain /infra/health ping. The restart poll must not be able to latch onto the
-  // process it just asked to shut down: /infra/health answers 200 for the whole drain and teardown,
+  // process it just asked to shut down: /infra/health answers 200 for the whole drain,
   // while /health/ready reports 503 as soon as draining starts and stays 503 until both databases
   // answer. Public (no API key), like /infra/health.
   healthCheck: () => request<{ status: 'ok' | 'error'; details: Record<string, { status: string }> }>('/health/ready'),

@@ -8,18 +8,55 @@ export interface CorsPolicy {
 }
 
 /**
+ * A CORS_ORIGINS entry as a browser sends it in `Origin`: scheme, host and port, with no path or trailing
+ * slash. An address copied from the bar of a browser carries both and would never equal a header.
+ * Anything that is not an http(s) URL is kept as written.
+ */
+function asOrigin(entry: string): string {
+  if (entry === '*') return entry;
+  try {
+    const url = new URL(entry);
+    return url.protocol === 'http:' || url.protocol === 'https:' ? url.origin : entry;
+  } catch {
+    return entry;
+  }
+}
+
+/** The CORS_ORIGINS entries that are used without part of what was written (a path or a trailing slash). */
+export function rewrittenCorsOrigins(corsOriginsEnv?: string): string[] {
+  return (corsOriginsEnv ?? '')
+    .split(',')
+    .map(o => o.trim())
+    .filter(o => o && asOrigin(o) !== o);
+}
+
+/**
  * Resolves the effective CORS policy from CORS_ORIGINS + NODE_ENV.
  * - Dev: wildcard allowed (no credentials with wildcard — spec-compliant).
  * - Prod: a wildcard origin is REFUSED (collapses to same-origin only) so a
  *   misconfigured deployment cannot reflect arbitrary origins with credentials.
  */
-export function resolveCorsPolicy(_: any, __: any): CorsPolicy {
+export function resolveCorsPolicy(corsOriginsEnv?: string, nodeEnv?: string): CorsPolicy {
+  const origins = corsOriginsEnv
+    ?.split(',')
+    .map(o => o.trim())
+    .filter(Boolean)
+    .map(asOrigin) ?? ['*'];
+  const hasWildcard = origins.includes('*');
+
+  // In production a wildcard origin is refused: collapse to same-origin only.
+  if (hasWildcard && nodeEnv === 'production') {
+    return { origins: [], allowAnyOrigin: false, credentials: false };
+  }
+
   return {
-    origins: ['*'],
-    credentials: false,
-    allowAnyOrigin: true,
+    origins,
+    allowAnyOrigin: hasWildcard,
+    // Credentials are only safe with an explicit allowlist, never with a wildcard.
+    credentials: !hasWildcard,
   };
 }
+
 /**
  * Whether to serve the Swagger UI (/api/docs). An explicit ENABLE_SWAGGER wins ('true'/'false').
  * When unset, it defaults ON outside production but OFF in production — the public API schema is
@@ -161,7 +198,6 @@ export interface SecretCheckEnv {
   postgresBuiltIn?: string;
   /** DATABASE_HOST — used to confirm a built-in exemption really points at the internal `postgres`. */
   databaseHost?: string;
-  databaseUrl?: string;
   storageType?: string;
   s3AccessKey?: string;
   s3SecretKey?: string;

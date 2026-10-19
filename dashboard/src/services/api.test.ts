@@ -6,6 +6,7 @@ import { test, before, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 
 let sessionApi: (typeof import('./api.ts'))['sessionApi'];
+let pluginsApi: (typeof import('./api.ts'))['pluginsApi'];
 const navigations: string[] = [];
 
 before(async () => {
@@ -17,7 +18,7 @@ before(async () => {
     configurable: true,
     writable: true,
   });
-  ({ sessionApi } = await import('./api.ts'));
+  ({ sessionApi, pluginsApi } = await import('./api.ts'));
 });
 
 beforeEach(() => {
@@ -66,6 +67,125 @@ test('a role 403 keeps the key and rejects with the status', async () => {
     return true;
   });
   assert.equal(sessionStorage.getItem('openwa_api_key'), 'stored-key');
+  assert.deepEqual(navigations, []);
+});
+
+// Each response shape the client reads, so the key check covers every path into the failure handler.
+const shapes = [
+  ['JSON', () => sessionApi.list()],
+  ['text', () => pluginsApi.getConfigUi('p1')],
+  ['blob', () => sessionApi.getMessageMediaBlob('s1', '100@c.us', 'WA1')],
+] as const;
+
+// Hold every response until the test releases them, recording the key each request was sent with.
+function deferAnswers(status: number, message: string): { sentKeys: (string | undefined)[]; release: () => void } {
+  const sentKeys: (string | undefined)[] = [];
+  const releases: (() => void)[] = [];
+  globalThis.fetch = ((_input: RequestInfo | URL, init?: RequestInit) => {
+    sentKeys.push((init?.headers as Record<string, string> | undefined)?.['X-API-Key']);
+    return new Promise<Response>(resolve => {
+      releases.push(() =>
+        resolve(
+          new Response(JSON.stringify({ statusCode: status, message }), {
+            status,
+            headers: { 'Content-Type': 'application/json' },
+          }),
+        ),
+      );
+    });
+  }) as typeof fetch;
+  return { sentKeys, release: () => releases.forEach(release => release()) };
+}
+
+// Both answers that prove a key unusable: a 401, and a 403 because the key's allowedIps refuse this client.
+const keyFailures = [
+  [401, 'API key is revoked'],
+  [403, 'IP address not allowed'],
+] as const;
+
+// A stale answer wrongly left pending drains the event loop, and node:test then cancels every later test;
+// holding a timer open past the per-test timeout lets that timeout fail just the one test instead.
+const stale = { timeout: 2000 };
+async function rejectsWithStatus(result: Promise<unknown>, status: number): Promise<void> {
+  const hold = setTimeout(() => {}, 3000);
+  try {
+    await assert.rejects(result, (err: Error & { status?: number }) => err.status === status);
+  } finally {
+    clearTimeout(hold);
+  }
+}
+
+for (const [status, message] of keyFailures) {
+  for (const [shape, call] of shapes) {
+    test(`a late ${status} ${shape} answer for a key signed out since keeps the key signed in now`, stale, async () => {
+      const pending = deferAnswers(status, message);
+      const result = call();
+      await new Promise(resolve => setImmediate(resolve));
+      assert.deepEqual(pending.sentKeys, ['stored-key']);
+      sessionStorage.removeItem('openwa_api_key');
+      sessionStorage.setItem('openwa_api_key', 'next-key');
+      pending.release();
+      await rejectsWithStatus(result, status);
+      assert.equal(sessionStorage.getItem('openwa_api_key'), 'next-key');
+      assert.deepEqual(navigations, []);
+    });
+
+    test(`a ${status} ${shape} answer for the key still in use clears it and returns to login`, async () => {
+      const pending = deferAnswers(status, message);
+      const result = call();
+      await new Promise(resolve => setImmediate(resolve));
+      pending.release();
+      assert.equal(await settled(result), false, 'the call settled, so its caller would render the failure');
+      assert.equal(sessionStorage.getItem('openwa_api_key'), null);
+      assert.deepEqual(navigations, ['/']);
+    });
+
+    test(`a late ${status} ${shape} answer while signed out stays silent and stays on the login form`, async () => {
+      const pending = deferAnswers(status, message);
+      const result = call();
+      await new Promise(resolve => setImmediate(resolve));
+      assert.deepEqual(pending.sentKeys, ['stored-key']);
+      sessionStorage.removeItem('openwa_api_key');
+      pending.release();
+      assert.equal(await settled(result), false, 'the call settled, so its caller would render the failure');
+      assert.equal(sessionStorage.getItem('openwa_api_key'), null);
+      assert.deepEqual(navigations, []);
+    });
+  }
+
+  test(`a burst of ${status}s for the key still in use keeps every call pending and navigates once`, async () => {
+    const pending = deferAnswers(status, message);
+    const results = shapes.map(([, call]) => call());
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(pending.sentKeys, ['stored-key', 'stored-key', 'stored-key']);
+    pending.release();
+    for (const result of results) {
+      assert.equal(await settled(result), false, 'the call settled, so its caller would render the failure');
+    }
+    assert.equal(sessionStorage.getItem('openwa_api_key'), null);
+    assert.deepEqual(navigations, ['/']);
+  });
+}
+
+test('a 401 for a request sent without a key while none is stored stays silent on the login form', async () => {
+  sessionStorage.removeItem('openwa_api_key');
+  answer(401, 'API key is required');
+  const result = sessionApi.list();
+  assert.equal(await settled(result), false, 'the call settled, so its caller would render the failure');
+  assert.equal(sessionStorage.getItem('openwa_api_key'), null);
+  assert.deepEqual(navigations, []);
+});
+
+test('a late 401 for a request sent while signed out keeps the key signed in since', stale, async () => {
+  sessionStorage.removeItem('openwa_api_key');
+  const pending = deferAnswers(401, 'API key is required');
+  const result = sessionApi.list();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(pending.sentKeys, [undefined]);
+  sessionStorage.setItem('openwa_api_key', 'next-key');
+  pending.release();
+  await rejectsWithStatus(result, 401);
+  assert.equal(sessionStorage.getItem('openwa_api_key'), 'next-key');
   assert.deepEqual(navigations, []);
 });
 
@@ -156,3 +276,80 @@ test('the contact list rejects instead of returning a partial list when a later 
     (err: Error & { status?: number }) => err.status === 429 && err.message === 'Too Many Requests',
   );
 });
+
+function chatResponse(data: unknown, status = 200): Response {
+  return new Response(JSON.stringify(data), { status, headers: { 'Content-Type': 'application/json' } });
+}
+
+for (const size of [1001, 2000, 11001]) {
+  test(`the chat list loads all ${size} conversations in bounded pages`, async () => {
+    const offsets: number[] = [];
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      const url = new URL(String(input), 'http://localhost');
+      const offset = Number(url.searchParams.get('offset'));
+      assert.equal(url.searchParams.get('limit'), '1000');
+      offsets.push(offset);
+      return chatResponse(
+        Array.from({ length: Math.min(1000, size - offset) }, (_, i) => ({ id: `chat-${offset + i}` })),
+      );
+    }) as typeof fetch;
+    const chats = await sessionApi.getChats('s1');
+    assert.equal(chats.length, size);
+    assert.equal(chats.at(-1)?.id, `chat-${size - 1}`);
+    assert.deepEqual(
+      offsets,
+      Array.from({ length: Math.floor(size / 1000) + 1 }, (_, i) => i * 1000),
+    );
+  });
+}
+
+test('chat pagination preserves first-seen order and deduplicates moving rows', async () => {
+  globalThis.fetch = (async (input: RequestInfo | URL) => {
+    const offset = Number(new URL(String(input), 'http://localhost').searchParams.get('offset'));
+    return chatResponse(
+      offset === 0
+        ? Array.from({ length: 1000 }, (_, i) => ({ id: `chat-${i}` }))
+        : [{ id: 'chat-999' }, { id: 'tail' }],
+    );
+  }) as typeof fetch;
+  const chats = await sessionApi.getChats('s1');
+  assert.equal(chats.length, 1001);
+  assert.equal(chats[999].id, 'chat-999');
+  assert.equal(chats[1000].id, 'tail');
+});
+
+for (const status of [500, 429]) {
+  test(`chat pagination rejects a later ${status} without returning a partial list`, async () => {
+    let attempts = 0;
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      const offset = Number(new URL(String(input), 'http://localhost').searchParams.get('offset'));
+      if (offset === 0) return chatResponse(Array.from({ length: 1000 }, (_, i) => ({ id: `chat-${i}` })));
+      attempts++;
+      return chatResponse({ message: 'Later page failed' }, status);
+    }) as typeof fetch;
+    await assert.rejects(sessionApi.getChats('s1'), (err: Error & { status?: number }) => err.status === status);
+    assert.equal(attempts, status === 429 ? 3 : 1);
+  });
+}
+
+for (const change of ['replace key', 'sign out', 'abort'] as const) {
+  test(`chat pagination stops before the next page after ${change}`, async () => {
+    let release!: (response: Response) => void;
+    let requests = 0;
+    const pending = new Promise<Response>(resolve => {
+      release = resolve;
+    });
+    const controller = new AbortController();
+    globalThis.fetch = (async () => {
+      requests++;
+      return pending;
+    }) as typeof fetch;
+    const result = sessionApi.getChats('s1', controller.signal);
+    if (change === 'replace key') sessionStorage.setItem('openwa_api_key', 'next-key');
+    if (change === 'sign out') sessionStorage.removeItem('openwa_api_key');
+    if (change === 'abort') controller.abort();
+    release(chatResponse(Array.from({ length: 1000 }, (_, i) => ({ id: `chat-${i}` }))));
+    await assert.rejects(result, change === 'abort' ? { name: 'AbortError' } : /Signed out/);
+    assert.equal(requests, 1);
+  });
+}

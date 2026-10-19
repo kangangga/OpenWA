@@ -50,6 +50,10 @@ export function generateIdempotencyKey(event: string, data: Record<string, unkno
       // the legacy `ack` integer for backward compatibility with older payloads.
       return `ack_${toStr(data.sessionId)}_${toStr(data.id ?? data.messageId)}_${toStr(data.status ?? data.ack, '0')}`;
 
+    case 'message.receipt':
+      // One receipt per recipient and status: the participant keeps two members' `read` apart.
+      return `receipt_${toStr(data.sessionId)}_${toStr(data.id ?? data.messageId)}_${toStr(data.participant)}_${toStr(data.status)}`;
+
     case 'message.failed':
       return `failed_${toStr(data.sessionId)}_${toStr(data.id ?? data.messageId)}_${toStr(data.status ?? data.ack, '0')}`;
 
@@ -108,6 +112,11 @@ export function generateIdempotencyKey(event: string, data: Record<string, unkno
       // A call id is unique per call and each call ends exactly once, so (session, call, outcome)
       // is already distinct — no occurrence salt, matching call.received's stable key.
       return `call_${toStr(data.sessionId)}_${toStr(data.callId)}_${toStr(data.outcome)}`;
+
+    case 'event.response':
+      // Each RSVP is its own message with its own id, and a changed answer is a new RSVP with a new
+      // id, so (session, RSVP id) is already unique per occurrence and stable across retries.
+      return `rsvp_${toStr(data.sessionId)}_${toStr(data.responseMessageId)}`;
 
     case 'presence.update':
       // Keyed on the chat and salted per occurrence. Only genuine state CHANGES are dispatched, and

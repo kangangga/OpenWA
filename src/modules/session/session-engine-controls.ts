@@ -4,12 +4,14 @@ import {
   ConflictException,
   HttpStatus,
   NotFoundException,
+  ServiceUnavailableException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { Repository, DataSource } from 'typeorm';
 import { Session, SessionStatus } from './entities/session.entity';
 import { Message } from '../message/entities/message.entity';
 import { MessageBatch } from '../message/entities/message-batch.entity';
+import { SendIdempotencyKey } from '../message/entities/send-idempotency-key.entity';
 import { Webhook } from '../webhook/entities/webhook.entity';
 import { WebhookOutboxEvent } from '../webhook/entities/webhook-outbox-event.entity';
 import { WebhookDeliveryFailure } from '../webhook/entities/webhook-delivery-failure.entity';
@@ -18,6 +20,7 @@ import { Template } from '../template/entities/template.entity';
 import { BaileysStoredMessage } from '../../engine';
 import { ChatState } from '../../engine/adapters/baileys-chat-state.entity';
 import { StatusUpdate } from '../status-store/entities/status-update.entity';
+import { closeSessionWrites } from '../../common/utils/session-write-scope';
 import { EngineFactory } from '../../engine/engine.factory';
 import { EngineRegistry } from '../../engine/engine-registry.service';
 import { IWhatsAppEngine } from '../../engine/interfaces/whatsapp-engine.interface';
@@ -41,6 +44,13 @@ import {
 
 /** A start refused because an operator stopped the session. Same 409 on the wire as any conflict. */
 export class SessionStoppedException extends ConflictException {}
+
+/** A start refused because the gateway is shutting down. Retryable once it is back. */
+export class ServerShuttingDownException extends ServiceUnavailableException {
+  constructor() {
+    super('Server is shutting down');
+  }
+}
 
 /**
  * The stop marks. Each add() stamps the id afresh, even one already marked, so start() can tell a mark
@@ -114,6 +124,8 @@ export interface SessionEngineControlsHost {
   updateStatus(id: string, status: SessionStatus): Promise<void>;
   /** Ownership gate, same contract as SessionEngineWiringHost.ownsSession. */
   ownsSession(id: string): boolean;
+  /** True once shutdown() has begun; the lifecycle never reopens. */
+  isClosed(): boolean;
   stoppingSessions: StopMarks;
   /** The engine each operator-initiated teardown is retiring; see the lifecycle field of the same name. */
   operatorTeardowns: Map<string, IWhatsAppEngine>;
@@ -280,12 +292,30 @@ export class SessionEngineControls {
       // it, and any other start yields to it with the mark put back. A stop from here on sets the
       // mark again and retires this start after its init. A launch that fails after the clear still
       // counts as the start the operator asked for.
-      if ((await this.requireSession(id)).desiredState === 'stopped') {
-        if (!explicit || session.desiredState !== 'stopped') {
-          this.stoppingSessions.add(id);
-          throw new SessionStoppedException(`Session ${id} was stopped`);
-        }
+      const { desiredState } = await this.requireSession(id);
+      if (desiredState === 'stopped' && (!explicit || session.desiredState !== 'stopped')) {
+        this.stoppingSessions.add(id);
+        throw new SessionStoppedException(`Session ${id} was stopped`);
+      }
+      // Shutdown may have begun during the reads above, past SessionService's own checks. A start the
+      // exiting process will not keep must not clear the stop or run the hook. A start that yielded to
+      // a stop answers as the stop, never as a retryable 503: one already on the row is refused above,
+      // and the mark (cleared above, so set by a stop or delete that began since) covers one whose row
+      // write has not landed yet.
+      const closedRefusal = (): Error =>
+        this.stoppingSessions.has(id)
+          ? new SessionStoppedException(`Session ${id} was stopped`)
+          : new ServerShuttingDownException();
+      if (this.host.isClosed()) {
+        throw closedRefusal();
+      }
+      if (desiredState === 'stopped') {
         await this.sessionRepository.update({ id, desiredState: 'stopped' }, { desiredState: null });
+        // The clear stands (this start was the operator's), but the hook must not fire for a start
+        // shutdown overtook during the write.
+        if (this.host.isClosed()) {
+          throw closedRefusal();
+        }
       }
 
       // Execute hook before starting
@@ -318,6 +348,7 @@ export class SessionEngineControls {
       const init = this.host.initializeEngine(id, session);
       const registered = this.engines.get(id);
       const mine = registered !== before ? registered : undefined;
+      let failedWritten = false;
       try {
         await init;
       } catch (err) {
@@ -338,8 +369,11 @@ export class SessionEngineControls {
           // Fenced on ownership like the engine callbacks: initializeEngine can await a slow
           // Chromium launch for minutes, and this node's lease can lapse and be taken over inside
           // that window. FAILED is excluded from the boot reset AND from the takeover sweep, so
-          // writing it onto a row a peer now owns strands the session on every node.
-          if (this.host.ownsSession(id)) {
+          // writing it onto a row a peer now owns strands the session on every node. Skipped during
+          // shutdown too: an init that rejects then usually does so because shutdown destroyed its
+          // engine, and the INITIALIZING row is reset by the next boot, where FAILED would not be.
+          if (this.host.ownsSession(id) && !this.host.isClosed()) {
+            failedWritten = true;
             await this.host.updateStatus(id, SessionStatus.FAILED).catch(() => undefined);
           }
         }
@@ -350,7 +384,14 @@ export class SessionEngineControls {
         if (!this.engines.has(id)) {
           this.host.cancelReconnect(id);
         }
-        throw err;
+        // Shutdown's destroy is the usual cause of an init rejecting now; the adapter's error would
+        // read as a fault (or, if transient, buy a retry shutdown refuses anyway). A start a stop
+        // retired keeps the adapter's error, as it would without shutdown. So does one whose FAILED
+        // went out before shutdown began: a transient error then reaches the retry, whose refusal
+        // hands the row back as DISCONNECTED for the next boot.
+        throw this.host.isClosed() && !failedWritten && !this.stoppingSessions.has(id)
+          ? new ServerShuttingDownException()
+          : err;
       }
 
       // A stop()/delete() may have landed while we awaited engine.initialize() — if so, tear down the
@@ -367,6 +408,11 @@ export class SessionEngineControls {
         // A delete() that raced this start purged the on-disk auth dirs BEFORE this init re-created
         // them — purge again so the window leaves no credential residue behind (no-op for a stop()).
         await this.host.purgeAuthDirsIfDeleted(id);
+      } else if (this.host.isClosed()) {
+        // Shutdown destroys every engine it finds, this one included, and skips initialize() for an
+        // engine it caught mid-start. Either way the session is not kept, so this is no success. A
+        // start retired above answers as the stop or delete that retired it instead.
+        throw new ServerShuttingDownException();
       }
       return this.requireSession(id);
     } finally {
@@ -641,6 +687,7 @@ export class SessionEngineControls {
     // sessionErrors (and the recovery budget, Task 8) are cleared ONLY on a committed delete; a
     // rejected 409 from fence #2 leaves them intact (the session still exists).
     let parentDeleted = false;
+    const writes = closeSessionWrites(this.host.dataSource(), id);
 
     try {
       // Stop engine if running — time-bounded + isolated so a stuck Chromium can't wedge the delete;
@@ -679,6 +726,7 @@ export class SessionEngineControls {
         throw fenceError;
       }
 
+      await writes.drain();
       // Execute hook BEFORE delete so plugins can access session data
       await this.hookManager.execute(
         'session:deleted',
@@ -704,9 +752,11 @@ export class SessionEngineControls {
       // because depending on a pragma neither this file nor a test pins is a thinner guarantee than
       // an explicit delete, and the ordering mirrors the restore path's explicit-clear. chat_states and
       // status_updates are in the no-FK group too, and so are the session's webhook outbox rows,
-      // webhook delivery-failure records and integration dead-letter rows (which keep full payloads).
-      // Those three are point-in-time: a delivery still in flight can write one after the commit, and
-      // their retention windows cover it.
+      // webhook delivery-failure records, integration dead-letter rows (which keep full payloads) and
+      // send idempotency claims (which keep the stored response of a send for 24 h, so a session
+      // re-created under the same id could not replay one). The webhook and dead-letter records are
+      // point-in-time: a delivery still in flight can write one after the commit, and their retention
+      // windows cover it.
       //
       // Deliberately kept: conversation_mappings (a re-paired session is rebound to its provider
       // conversations, see ConversationMappingService.rebindSession), ingress_events (the
@@ -723,6 +773,7 @@ export class SessionEngineControls {
         await manager.delete(WebhookOutboxEvent, { sessionId: id });
         await manager.delete(WebhookDeliveryFailure, { sessionId: id });
         await manager.delete(IntegrationDeliveryFailure, { sessionId: id });
+        await manager.delete(SendIdempotencyKey, { sessionId: id });
         await manager.remove(session);
       });
       parentDeleted = true;
@@ -747,6 +798,7 @@ export class SessionEngineControls {
       const nameIsAnId = await this.sessionRepository.exists({ where: { id: session.name } }).catch(() => true);
       await this.engineFactory.purgeSessionData(id, nameIsAnId ? undefined : session.name);
     } finally {
+      writes.release();
       // Always clear the teardown mark so a later recreate/start with this id isn't suppressed. This
       // stop mark was set after fence #1, so clearing it on a rejected 409 only undoes what THIS
       // delete added — it does NOT touch reconnect timer / engine / last status / error / recovery

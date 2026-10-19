@@ -339,7 +339,6 @@ export class InfraConfigController {
         databaseType: bootValue('DATABASE_TYPE'),
         databasePassword: bootValue('DATABASE_PASSWORD'),
         postgresBuiltIn: bootValue('POSTGRES_BUILTIN'),
-        databaseUrl: bootValue('DATABASE_URL'),
         databaseHost: bootValue('DATABASE_HOST'),
         storageType: bootValue('STORAGE_TYPE'),
         // The same canonical-with-legacy fallback main.ts and storage.service apply.

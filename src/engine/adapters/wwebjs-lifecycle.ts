@@ -169,15 +169,14 @@ const WA_STATE_RESTRICTIONS: Readonly<Record<string, AccountRestriction['kind']>
  * Host surface for {@link WwebjsLifecycle}. The adapter keeps the public engine methods as thin
  * forwarders and builds ONE object literal of these closures, so the delegate drives connection
  * state only through the seams named here: the sibling delegates it coordinates (reconcile,
- * onboarding watcher, call cache, stuck-auth) and the adapter-owned event surface.
+ * onboarding watcher, call cache, stuck-auth) and the adapter-owned callbacks and domain-event
+ * registration.
  */
 export interface WwebjsLifecycleHost {
   readonly logger: ReturnType<typeof createLogger>;
   readonly config: WhatsAppWebJsConfig;
   /** Live callbacks bag — read per event, since initialize() installs it after delegates are built. */
   getCallbacks(): EngineEventCallbacks;
-  /** Re-emit a status transition on the adapter's EventEmitter (`stateChanged`). */
-  emitState(status: EngineStatus): void;
   /** Arm / disarm the post-authentication readiness reconciliation (./wwebjs-reconcile). */
   scheduleReadyReconcile(): void;
   clearReadyReconcile(): void;
@@ -245,6 +244,8 @@ export class WwebjsLifecycle {
   // exact jest timer counts, and a timer would also outlive the single-use adapter.
   private lastMainFrameNavigationAt = 0;
   private navigationEpisodeStartedAt = 0;
+  /** Counts the navigations stamped, so a probe can tell that one landed while it was waiting. */
+  private navigationCount = 0;
   /** The WhatsApp Web build this init asked whatsapp-web.js to pin, undefined when it asked for none.
    *  Compared against the build the page reports at READY (./wwebjs-running-build). */
   private requestedWebVersion: string | undefined;
@@ -761,6 +762,7 @@ export class WwebjsLifecycle {
       // lastLoggedOut is a runtime field the wwjs typings do not declare (same loose-cast pattern as
       // the pupBrowser/pupPage handles above).
       if ((this.client as unknown as { lastLoggedOut?: boolean } | null)?.lastLoggedOut) return;
+      this.navigationCount++;
       const now = Date.now();
       if (this.navigationEpisodeStartedAt === 0) this.navigationEpisodeStartedAt = now;
       this.lastMainFrameNavigationAt = now;
@@ -796,6 +798,10 @@ export class WwebjsLifecycle {
     this.setStatus(EngineStatus.DISCONNECTED);
     this.host.getCallbacks().onDisconnected?.(reason);
   }
+
+  /** How many times, and how far apart, {@link reportOnceGone} looks for puppeteer to mark a page gone. */
+  private static readonly PAGE_GONE_POLLS = 25;
+  private static readonly PAGE_GONE_POLL_MS = 20;
 
   /**
    * Error-message signatures of a dead page/transport: Puppeteer raises these when the browser
@@ -848,6 +854,38 @@ export class WwebjsLifecycle {
     if (!this.isPageTransportError(error)) {
       return;
     }
+    this.reportDeath(error, context);
+  }
+
+  /**
+   * For a best-effort read that carries on after a failure, which must not take the session down on an
+   * error's text: a page-side exception can quote "connection closed" about WhatsApp Web's own socket while
+   * the page is fine. Puppeteer rejects a call pending on a dying page a few milliseconds BEFORE it marks
+   * the page closed or the browser disconnected (measured with Chromium stopped by SIGTERM and with a tab
+   * closed from outside; a killed browser already reads disconnected), so the page gets a short while to
+   * show it is gone. A page that still reads alive after that is not reported and the caller carries on.
+   */
+  async reportOnceGone(error: unknown, context: string): Promise<void> {
+    if (!this.isPageTransportError(error)) return;
+    // Counted in polls rather than elapsed time: every poll hands the event loop a turn, which is when
+    // puppeteer's close events are delivered, even if the process was starved for longer than the wait.
+    for (let polls = 0; polls < WwebjsLifecycle.PAGE_GONE_POLLS; polls++) {
+      if (this.status !== EngineStatus.READY || this.isPageGone()) break;
+      await new Promise(resolve => setTimeout(resolve, WwebjsLifecycle.PAGE_GONE_POLL_MS));
+    }
+    // Not READY any more means a death listener or a teardown got there first and owns the report.
+    if (this.status !== EngineStatus.READY) return;
+    if (!this.isPageGone()) {
+      this.host.logger.warn(`Page transport error during ${context} while the page is alive, not a death`, {
+        error: error instanceof Error ? error.message : String(error),
+        action: 'page_transport_error_page_alive',
+      });
+      return;
+    }
+    this.reportDeath(error, context);
+  }
+
+  private reportDeath(error: unknown, context: string): void {
     // Inside the navigation re-inject window the same signatures ride a HEALING page: an in-flight
     // evaluate killed by the navigation keeps its 'Protocol error' prefix (puppeteer only rewrites
     // the shapes that END with a context-gone suffix), and a navigating page transiently detaches
@@ -869,6 +907,15 @@ export class WwebjsLifecycle {
       error: error instanceof Error ? error.message : String(error),
     });
     this.handlePuppeteerDeath(`Page transport error during ${context}`);
+  }
+
+  /** Whether puppeteer itself reports the page closed or the browser disconnected (not an error's text). */
+  private isPageGone(): boolean {
+    const { pupBrowser, pupPage } = (this.client ?? {}) as unknown as {
+      pupBrowser?: { connected?: boolean };
+      pupPage?: { isClosed?: () => boolean };
+    };
+    return pupPage?.isClosed?.() === true || pupBrowser?.connected === false;
   }
 
   markReadyFromClientInfo(): void {
@@ -920,9 +967,9 @@ export class WwebjsLifecycle {
     void reportRunningWebBuild(page, this.host.logger, this.host.config.sessionId, this.requestedWebVersion);
   }
 
-  /** The single status-transition funnel: latches disconnectReported, fires the callback, re-emits
-   *  on the adapter's EventEmitter. Public because the sibling delegates (reconcile, stuck-auth,
-   *  onboarding watcher) drive transitions through their host slices. */
+  /** The single status-transition funnel: latches disconnectReported and fires the callback. Public
+   *  because the sibling delegates (reconcile, stuck-auth, onboarding watcher) drive transitions
+   *  through their host slices. */
   setStatus(status: EngineStatus): void {
     // Latch before anything observes the transition. The constructor's initial DISCONNECTED is a field
     // initializer and never reaches here, so this only ever fires on a real transition — startup is
@@ -939,7 +986,6 @@ export class WwebjsLifecycle {
     }
     this.status = status;
     this.host.getCallbacks().onStateChanged?.(status);
-    this.host.emitState(status);
   }
 
   private beginClientTeardown(): Client | null {
@@ -1114,7 +1160,12 @@ export class WwebjsLifecycle {
    * failing probe answers alive, since the page is healing, not dead (#1081).
    */
   async probeLiveness(): Promise<boolean> {
-    if (this.status !== EngineStatus.READY || !this.client) return false;
+    // The watchdog also probes an ACTION_REQUIRED session, observe-only (it never reconnects one): the page
+    // is still up while the operator acts. Answering false without asking made every such session look
+    // dead on the first tick, and hid a page that really had died.
+    const probeable = this.status === EngineStatus.READY || this.status === EngineStatus.ACTION_REQUIRED;
+    if (!probeable || !this.client) return false;
+    const navigationsBefore = this.navigationCount;
 
     let timeout: ReturnType<typeof setTimeout> | undefined;
     try {
@@ -1128,8 +1179,9 @@ export class WwebjsLifecycle {
       if (state === WAState.CONNECTED) {
         // Observed recovery closes the navigation episode. Without this, an episode whose re-inject
         // died silently (no 'ready' re-emit, but WA Web's socket back up) would keep a stale episode
-        // anchor forever, denying the grace to every LATER navigation via the episode cap.
-        this.clearNavigationReinjectWindow();
+        // anchor forever, denying the grace to every LATER navigation via the episode cap. Only an episode
+        // this answer can speak for: a navigation stamped while getState() was pending is a newer one.
+        if (navigationsBefore === this.navigationCount) this.clearNavigationReinjectWindow();
         return true;
       }
       return this.isInNavigationReinjectWindow();
@@ -1185,7 +1237,8 @@ export class WwebjsLifecycle {
         const transient =
           error instanceof PairingCodeAttemptTimeoutError ||
           isExecutionContextDestroyedError(reason) ||
-          /callfunctionon timed out|timed out\. increase the 'protocoltimeout'/i.test(reason);
+          isProtocolTimeout(error) ||
+          /callfunctionon timed out/i.test(reason);
         if (!transient) {
           throw error;
         }

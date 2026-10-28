@@ -1,4 +1,4 @@
-import { Fragment, useState, useEffect, useRef, type ChangeEvent } from 'react';
+import { Fragment, useState, useEffect, useMemo, useRef, type ChangeEvent } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Send, CheckCircle, XCircle, Loader2, Upload, X, Plus, AlertCircle } from 'lucide-react';
 import {
@@ -30,9 +30,11 @@ import {
 import { PageHeader } from '../components/PageHeader';
 import { GroupPicker } from '../components/GroupPicker';
 import { groupLabel, isGatewayRefusal, planGroupSend } from '../utils/groupSelection';
+import { normalizePhoneText } from '../utils/phone';
 import { sendSequentially } from '../utils/sendSequentially';
 import { keepsSameKey } from '../utils/authLifecycle';
 import './MessageTester.css';
+import { MEDIA_UPLOAD_MAX_BYTES } from '../utils/mediaUpload';
 
 interface ApiResponse {
   success: boolean;
@@ -51,6 +53,7 @@ interface ApiResponse {
     failures: { id: string; name: string; error: string }[];
     notSent: number;
     stoppedBy?: 'abort' | 'refusal';
+    // The status that stopped the run; absent when a fetch got no answer at all.
     refusedWith?: number;
   };
 }
@@ -114,12 +117,6 @@ const fallbackMime: Record<(typeof messageTypes)[number], string> = {
   forward: 'application/octet-stream',
   bulk: 'application/octet-stream',
 };
-
-// Client pre-check before base64-encoding an upload. Aligned with the default request-body limit: base64
-// inflates ~1.33x, so ~18 MiB raw stays under the 25 MiB BODY_SIZE_LIMIT and lets the backend reject with a
-// clear 413 instead of the tab OOMing on a multi-hundred-MB pick before the request is even sent. The
-// backend's MEDIA_DOWNLOAD_MAX_BYTES (default 50 MiB) stays authoritative for URL sends (fetched server-side).
-const MEDIA_UPLOAD_MAX_BYTES = 18 * 1024 * 1024;
 
 // Batch statuses that stop the progress polling (mirrors the backend BatchStatus enum).
 const TERMINAL_BATCH_STATUSES: readonly BatchStatus[] = ['completed', 'cancelled', 'failed'];
@@ -334,7 +331,7 @@ export function MessageTester() {
   };
 
   const isMediaMessageType = mediaMessageTypes.includes(messageType);
-  const bulkRecipientList = parseBulkRecipients(bulkRecipients);
+  const bulkRecipientList = useMemo(() => parseBulkRecipients(bulkRecipients), [bulkRecipients]);
   const pollOptionsFilled = pollOptions.map(o => o.trim()).filter(o => o.length > 0);
   const lat = parseFloat(latitude);
   const lng = parseFloat(longitude);
@@ -511,7 +508,7 @@ export function MessageTester() {
       // Bulk carries its own recipient list, so the shared selector's target is not resolved there.
       let chatId = targetId;
       if (messageType !== 'bulk' && recipientType !== 'group') {
-        const resolved = await contactApi.checkNumber(session, targetId.replace(/[^0-9]/g, ''));
+        const resolved = await contactApi.checkNumber(session, normalizePhoneText(targetId).replace(/[^0-9]/g, ''));
         assertCurrent();
         if (!resolved.exists || !resolved.whatsappId) {
           setResponse({
@@ -593,7 +590,10 @@ export function MessageTester() {
             // through the same check-number flow as the main recipient.
             let toChatId = forwardTo.trim();
             if (!toChatId.includes('@')) {
-              const resolvedTo = await contactApi.checkNumber(session, toChatId.replace(/[^0-9]/g, ''));
+              const resolvedTo = await contactApi.checkNumber(
+                session,
+                normalizePhoneText(toChatId).replace(/[^0-9]/g, ''),
+              );
               assertCurrent();
               if (!resolvedTo.exists || !resolvedTo.whatsappId) throw new Error(t('messageTester.notOnWhatsApp'));
               toChatId = resolvedTo.whatsappId;
@@ -816,7 +816,7 @@ export function MessageTester() {
                     <label htmlFor="mt-13">{t('messageTester.recipientPhone')}</label>
                     <input
                       id="mt-13"
-                      type="text"
+                      type="tel"
                       value={recipient}
                       onChange={e => setRecipient(e.target.value)}
                       placeholder="+62812345678"
@@ -975,7 +975,7 @@ export function MessageTester() {
                   <label htmlFor="mt-7">{t('messageTester.contactNumber')}</label>
                   <input
                     id="mt-7"
-                    type="text"
+                    type="tel"
                     value={contactNumber}
                     onChange={e => setContactNumber(e.target.value)}
                     placeholder="+62812345678"
@@ -1054,6 +1054,7 @@ export function MessageTester() {
                   <input
                     id="mt-17"
                     type="text"
+                    dir="ltr"
                     value={forwardFrom}
                     onChange={e => setForwardFrom(e.target.value)}
                     placeholder={
@@ -1068,6 +1069,7 @@ export function MessageTester() {
                   <input
                     id="mt-9"
                     type="text"
+                    dir="ltr"
                     value={forwardTo}
                     onChange={e => setForwardTo(e.target.value)}
                     placeholder={t('messageTester.forwardToPlaceholder')}
@@ -1078,6 +1080,7 @@ export function MessageTester() {
                   <input
                     id="mt-10"
                     type="text"
+                    dir="ltr"
                     value={forwardMessageId}
                     onChange={e => setForwardMessageId(e.target.value)}
                   />
@@ -1113,6 +1116,7 @@ export function MessageTester() {
                   </div>
                   <textarea
                     id="mt-11"
+                    dir="ltr"
                     value={bulkRecipients}
                     onChange={e => setBulkRecipients(e.target.value)}
                     placeholder={t('messageTester.bulkRecipientsPlaceholder')}
@@ -1256,7 +1260,7 @@ export function MessageTester() {
                 {response.error && (
                   <div className="detail-row">
                     <span className="detail-label">{t('messageTester.response.error')}</span>
-                    <span className="detail-value" style={{ color: 'var(--error)' }}>
+                    <span className="detail-value" style={{ color: 'var(--error-text)' }}>
                       {response.error}
                     </span>
                   </div>
@@ -1289,10 +1293,12 @@ export function MessageTester() {
                     <span className="detail-label">{t('messageTester.response.notSent')}</span>
                     <span className="detail-value">
                       {response.groups.stoppedBy === 'refusal'
-                        ? t('messageTester.groupSendStopped', {
-                            count: response.groups.notSent,
-                            status: response.groups.refusedWith,
-                          })
+                        ? response.groups.refusedWith === undefined
+                          ? t('messageTester.groupSendStoppedNoAnswer', { count: response.groups.notSent })
+                          : t('messageTester.groupSendStopped', {
+                              count: response.groups.notSent,
+                              status: response.groups.refusedWith,
+                            })
                         : t('messageTester.groupSendCancelled', { count: response.groups.notSent })}
                     </span>
                   </div>

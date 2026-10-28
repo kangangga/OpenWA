@@ -1,4 +1,4 @@
-import { useState, useMemo, useRef, useCallback, useEffect } from 'react';
+import { useState, useMemo, useCallback, useEffect, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
 import {
   UserCheck,
@@ -16,41 +16,52 @@ import {
   Phone,
   Search,
 } from 'lucide-react';
+import { Trans, useTranslation } from 'react-i18next';
 import { PageHeader } from '../components/PageHeader';
 import { useDocumentTitle } from '../hooks/useDocumentTitle';
+import { copyToClipboard } from '../utils/clipboard';
 import { useSessionsQuery } from '../hooks/queries';
-import { contactApi, type CheckNumberResponse } from '../services/api';
+import { contactApi } from '../services/api';
 import { useToast } from '../hooks/useToast';
 import { useRole } from '../hooks/useRole';
+import { batchStopMessage, useNumberCheck, type CheckResultItem } from '../hooks/useNumberCheck';
 import { escapeCsvCell } from '../utils/csv';
+import { normalizePhoneText } from '../utils/phone';
+import { keepsSameKey } from '../utils/authLifecycle';
 import './NumberChecker.css';
 
-export type CheckStatus = 'registered' | 'unregistered' | 'failed';
+// Every lookup is an outbound WhatsApp query that counts against the gateway's per-IP limit on this route
+// (100 a minute by default) and against the linked account's standing, so one run is capped.
+export const NUMBER_CHECK_BATCH_MAX = 100;
 
-export interface CheckResultItem extends CheckNumberResponse {
-  status: CheckStatus;
-  error?: string | null;
-  avatarUrl?: string | null;
-  timestamp: string;
-}
+const timeOfDay = (iso: string) => new Date(iso).toLocaleTimeString();
 
 export function NumberChecker() {
-  useDocumentTitle('Number Checker - OpenWA');
+  const { t } = useTranslation();
+  useDocumentTitle(t('nav.numberChecker'));
   const navigate = useNavigate();
   const toast = useToast();
   const { canWrite } = useRole();
+  // The bulk run lives above the routes, so it is still going (or its rows are still here) when this page opens again.
+  const run = useNumberCheck();
+  const isCheckingBatch = run.running;
+  const batchResults = run.results;
+  const batchProgress = run.progress;
+  const batchStop = run.stopped;
 
   const { data: sessions = [], isLoading: loadingSessions } = useSessionsQuery();
-  const readySessions = useMemo(
-    () => sessions.filter(s => s.status?.toLowerCase() === 'ready' || s.status?.toLowerCase() === 'authenticated'),
-    [sessions],
-  );
+  const readySessions = useMemo(() => sessions.filter(s => s.status === 'ready'), [sessions]);
 
   const [selectedSession, setSelectedSession] = useState<string>('');
-  const [activeTab, setActiveTab] = useState<'single' | 'batch'>('single');
+  const [activeTab, setActiveTab] = useState<'single' | 'batch'>(
+    isCheckingBatch || batchResults.length > 0 ? 'batch' : 'single',
+  );
 
-  // Set default session when loaded (API requires session UUID)
-  const currentSession = selectedSession || readySessions[0]?.id || '';
+  // The chosen session, else the first ready one (API requires session UUID). A chosen session that leaves
+  // the ready list on a refetch would otherwise stay in use while the select shows the first option.
+  const currentSession = readySessions.some(s => s.id === selectedSession)
+    ? selectedSession
+    : (readySessions[0]?.id ?? '');
 
   // Single Check State
   const [phoneNumber, setPhoneNumber] = useState('');
@@ -60,27 +71,28 @@ export function NumberChecker() {
   const [recentChecks, setRecentChecks] = useState<CheckResultItem[]>([]);
 
   // Batch Check State
-  const [batchInput, setBatchInput] = useState('');
-  const [batchDelay, setBatchDelay] = useState<number>(1000);
-  const [isCheckingBatch, setIsCheckingBatch] = useState(false);
-  const [batchResults, setBatchResults] = useState<CheckResultItem[]>([]);
-  const [batchProgress, setBatchProgress] = useState({ current: 0, total: 0 });
-  const [batchFilter, setBatchFilter] = useState<'all' | 'registered' | 'unregistered' | 'failed'>('all');
-  const batchRunIdRef = useRef<number>(0);
-
+  const [batchInput, setBatchInput] = useState(() => run.numbers.join('\n'));
+  const [batchDelay, setBatchDelay] = useState<number>(run.delay);
+  // The session a running bulk run is bound to. Both selects are locked meanwhile, so they keep showing it even if
+  // the chosen session leaves the ready list and returns during the run, and a single check goes to it too.
+  const shownSession = isCheckingBatch ? run.session : currentSession;
+  const singleRun = useRef(0);
   useEffect(() => {
-    const runRef = batchRunIdRef;
+    singleRun.current += 1;
+    setIsCheckingSingle(false);
     return () => {
-      runRef.current++;
+      singleRun.current += 1;
     };
-  }, []);
+  }, [shownSession]);
+  const [batchFilter, setBatchFilter] = useState<'all' | 'registered' | 'unregistered' | 'failed'>('all');
 
-  // Auto-prefix country code state
-  const [autoPrefix91, setAutoPrefix91] = useState(true);
+  // Opt-in: the +91 rewrite would turn any other country's 10-digit or 0-prefixed number into an Indian one.
+  const [autoPrefix91, setAutoPrefix91] = useState(false);
 
   // Format and clean phone number based on digit rules
   const formatNumberForCheck = useCallback(
-    (raw: string, applyPrefix = autoPrefix91) => {
+    (typed: string, applyPrefix = autoPrefix91) => {
+      const raw = normalizePhoneText(typed);
       let digits = raw.replace(/[^0-9]/g, '');
       const isInternational = raw.trim().startsWith('+') || digits.startsWith('00');
       // 1. If international dial exit code 00 is present (e.g. 009196...), strip '00'
@@ -109,11 +121,12 @@ export function NumberChecker() {
   const singleFormattedNumber = useMemo(() => {
     return formatNumberForCheck(phoneNumber);
   }, [phoneNumber, formatNumberForCheck]);
+  const singleTypedDigits = normalizePhoneText(phoneNumber).replace(/[^0-9]/g, '');
 
   // Batch parsing statistics
   const batchParsedStats = useMemo(() => {
-    const lines = batchInput
-      .split(/[\n,;]+/)
+    const lines = normalizePhoneText(batchInput)
+      .split(/[\n,;\t\u060C\u061B]+/)
       .map(n => n.trim())
       .filter(n => n.length > 0);
 
@@ -152,126 +165,85 @@ export function NumberChecker() {
       list: Array.from(uniqueFormatted),
     };
   }, [batchInput, autoPrefix91, formatNumberForCheck]);
+  const batchOverLimit = batchParsedStats.uniqueCount > NUMBER_CHECK_BATCH_MAX;
 
   // Perform single check
   const handleSingleCheck = async () => {
     if (!canWrite || isCheckingSingle) return;
     const formatted = formatNumberForCheck(phoneNumber);
     if (!formatted) {
-      toast.error('Please enter a phone number to check.');
+      toast.error(t('numberChecker.toast.enterNumber'));
       return;
     }
-    if (!currentSession) {
-      toast.error('No ready WhatsApp session available.');
+    if (!shownSession) {
+      toast.error(t('numberChecker.toast.noSession'));
       return;
     }
 
+    const request = ++singleRun.current;
+    const sameKey = keepsSameKey();
+    const isCurrent = () => singleRun.current === request && sameKey();
     setIsCheckingSingle(true);
     try {
-      const res = await contactApi.checkNumber(currentSession, formatted);
+      const res = await contactApi.checkNumber(shownSession, formatted);
+      if (!isCurrent()) return;
       let avatar: string | null = null;
       if (res.exists && res.whatsappId) {
         try {
-          const pic = await contactApi.profilePicture(currentSession, res.whatsappId);
+          const pic = await contactApi.profilePicture(shownSession, res.whatsappId);
           avatar = pic.url;
         } catch {
           // Profile picture is optional
         }
       }
 
+      if (!isCurrent()) return;
       const item: CheckResultItem = {
         ...res,
         status: res.exists ? 'registered' : 'unregistered',
         error: null,
         avatarUrl: avatar,
-        timestamp: new Date().toLocaleTimeString(),
+        timestamp: new Date().toISOString(),
       };
 
       setSingleResult(item);
       setRecentChecks(prev => [item, ...prev.filter(p => p.number !== item.number).slice(0, 9)]);
     } catch (err) {
-      toast.error('Check failed', err instanceof Error ? err.message : 'Unknown lookup error');
+      if (!isCurrent()) return;
+      toast.error(
+        t('numberChecker.toast.checkFailed'),
+        err instanceof Error ? err.message : t('numberChecker.toast.unknownError'),
+      );
     } finally {
-      setIsCheckingSingle(false);
+      if (singleRun.current === request) setIsCheckingSingle(false);
     }
   };
 
   // Copy WhatsApp ID
-  const handleCopy = (id: string) => {
-    navigator.clipboard.writeText(id);
-    setCopiedId(true);
-    setTimeout(() => setCopiedId(false), 2000);
+  const handleCopy = async (id: string) => {
+    // The house helper: over plain HTTP on a LAN address navigator.clipboard does not exist.
+    if (await copyToClipboard(id)) {
+      setCopiedId(true);
+      setTimeout(() => setCopiedId(false), 2000);
+    }
   };
 
   // Perform batch check
-  const handleStartBatch = async () => {
+  const handleStartBatch = () => {
     if (!canWrite || isCheckingBatch) return;
     const numbers = batchParsedStats.list;
 
     if (numbers.length === 0) {
-      toast.error('Please enter valid phone numbers (one per line or comma-separated).');
+      toast.error(t('numberChecker.toast.enterNumbers'));
       return;
     }
     if (!currentSession) {
-      toast.error('No ready WhatsApp session available.');
+      toast.error(t('numberChecker.toast.noSession'));
       return;
     }
 
-    const runId = ++batchRunIdRef.current;
-    setIsCheckingBatch(true);
-    setBatchResults([]);
-    setBatchProgress({ current: 0, total: numbers.length });
-
-    const results: CheckResultItem[] = [];
-
-    for (let i = 0; i < numbers.length; i++) {
-      if (batchRunIdRef.current !== runId) return;
-
-      const num = numbers[i];
-      try {
-        const res = await contactApi.checkNumber(currentSession, num);
-        if (batchRunIdRef.current !== runId) return;
-
-        const item: CheckResultItem = {
-          ...res,
-          status: res.exists ? 'registered' : 'unregistered',
-          error: null,
-          timestamp: new Date().toLocaleTimeString(),
-        };
-        results.push(item);
-        setBatchResults([...results]);
-      } catch (err) {
-        if (batchRunIdRef.current !== runId) return;
-
-        const errorMsg = err instanceof Error ? err.message : 'Lookup failed';
-        results.push({
-          number: num,
-          exists: false,
-          whatsappId: null,
-          status: 'failed',
-          error: errorMsg,
-          timestamp: new Date().toLocaleTimeString(),
-        });
-        setBatchResults([...results]);
-      }
-
-      if (batchRunIdRef.current !== runId) return;
-      setBatchProgress({ current: i + 1, total: numbers.length });
-
-      if (i < numbers.length - 1 && batchDelay > 0) {
-        await new Promise(resolve => setTimeout(resolve, batchDelay));
-        if (batchRunIdRef.current !== runId) return;
-      }
-    }
-
-    if (batchRunIdRef.current !== runId) return;
-    setIsCheckingBatch(false);
-    toast.success(`Completed checking ${results.length} numbers.`);
-  };
-
-  const handleStopBatch = () => {
-    batchRunIdRef.current++;
-    setIsCheckingBatch(false);
+    setBatchFilter('all');
+    void run.start(numbers, currentSession, batchDelay);
   };
 
   // Filter batch results
@@ -285,6 +257,8 @@ export function NumberChecker() {
   // Export batch results as CSV
   const handleExportCSV = () => {
     if (batchResults.length === 0) return;
+    // The export stays English: it is data for other tools, and a header that follows the dashboard's
+    // language would break whatever reads it.
     const header = 'Phone Number,Has WhatsApp,WhatsApp ID,Error,Checked At\n';
     const rows = batchResults
       .map(r => {
@@ -310,11 +284,11 @@ export function NumberChecker() {
   return (
     <div className="number-checker">
       <PageHeader
-        title="Number Checker"
-        subtitle="Verify if phone numbers have active WhatsApp accounts silently without sending messages"
+        title={t('nav.numberChecker')}
+        subtitle={t('numberChecker.subtitle')}
         badge={
           <span className="nc-status-badge registered">
-            <Shield size={14} /> Zero Messages Sent
+            <Shield size={14} /> {t('numberChecker.zeroMessages')}
           </span>
         }
       />
@@ -326,24 +300,32 @@ export function NumberChecker() {
             <AlertCircle size={22} />
           </div>
           <div className="nc-alert-content">
-            <strong>No active WhatsApp session connected.</strong>
-            <p style={{ margin: '0.25rem 0 0' }}>
-              To check phone numbers, OpenWA requires at least one authenticated session.
-            </p>
+            <strong>{t('numberChecker.noSession.title')}</strong>
+            <p style={{ margin: '0.25rem 0 0' }}>{t('numberChecker.noSession.desc')}</p>
           </div>
           <button className="nc-alert-action" onClick={() => navigate('/sessions')}>
-            <Smartphone size={16} /> Go to Sessions
+            <Smartphone size={16} /> {t('numberChecker.noSession.goToSessions')}
           </button>
         </div>
       )}
 
       {/* Mode Tabs */}
-      <div className="nc-tabs">
-        <button className={`nc-tab ${activeTab === 'single' ? 'active' : ''}`} onClick={() => setActiveTab('single')}>
-          <Phone size={18} /> Single Check
+      <div className="nc-tabs" role="tablist">
+        <button
+          role="tab"
+          aria-selected={activeTab === 'single'}
+          className={`nc-tab ${activeTab === 'single' ? 'active' : ''}`}
+          onClick={() => setActiveTab('single')}
+        >
+          <Phone size={18} /> {t('numberChecker.tabs.single')}
         </button>
-        <button className={`nc-tab ${activeTab === 'batch' ? 'active' : ''}`} onClick={() => setActiveTab('batch')}>
-          <UserCheck size={18} /> Bulk Number Checker
+        <button
+          role="tab"
+          aria-selected={activeTab === 'batch'}
+          className={`nc-tab ${activeTab === 'batch' ? 'active' : ''}`}
+          onClick={() => setActiveTab('batch')}
+        >
+          <UserCheck size={18} /> {t('numberChecker.tabs.bulk')}
         </button>
       </div>
 
@@ -352,22 +334,22 @@ export function NumberChecker() {
           <div className="nc-grid">
             {/* Input Card */}
             <div className="nc-card">
-              <h2 className="nc-card-title">Check Single Account</h2>
+              <h2 className="nc-card-title">{t('numberChecker.single.title')}</h2>
 
               <div className="nc-form-group">
                 <label htmlFor="nc-single-session" className="nc-label">
-                  WhatsApp Session
+                  {t('numberChecker.session.label')}
                 </label>
                 <select
                   id="nc-single-session"
-                  aria-label="WhatsApp Session"
+                  aria-label={t('numberChecker.session.label')}
                   className="nc-input"
-                  value={currentSession}
+                  value={shownSession}
                   onChange={e => setSelectedSession(e.target.value)}
-                  disabled={readySessions.length === 0}
+                  disabled={readySessions.length === 0 || isCheckingBatch}
                 >
                   {readySessions.length === 0 ? (
-                    <option value="">No ready sessions available</option>
+                    <option value="">{t('numberChecker.session.none')}</option>
                   ) : (
                     readySessions.map(s => (
                       <option key={s.id} value={s.id}>
@@ -376,16 +358,20 @@ export function NumberChecker() {
                     ))
                   )}
                 </select>
-                <span className="nc-hint">Queries are routed through this connected WhatsApp account.</span>
+                <span className="nc-hint">{t('numberChecker.session.hint')}</span>
               </div>
 
               <div className="nc-form-group">
-                <label className="nc-label">Phone Number</label>
+                <label htmlFor="nc-single-phone" className="nc-label">
+                  {t('numberChecker.single.phoneLabel')}
+                </label>
                 <div className="nc-input-row">
                   <input
+                    id="nc-single-phone"
                     type="text"
+                    dir="ltr"
                     className="nc-input"
-                    placeholder="e.g. 9876543210 (10 digits) or 919876543210 (12 digits)"
+                    placeholder={t('numberChecker.single.phonePlaceholder')}
                     value={phoneNumber}
                     onChange={e => setPhoneNumber(e.target.value)}
                     onKeyDown={e => {
@@ -399,7 +385,7 @@ export function NumberChecker() {
                     disabled={!canWrite || isCheckingSingle || !phoneNumber.trim() || readySessions.length === 0}
                   >
                     {isCheckingSingle ? <Loader2 size={18} className="animate-spin" /> : <Search size={18} />}
-                    {isCheckingSingle ? 'Checking...' : 'Check'}
+                    {isCheckingSingle ? t('numberChecker.single.checking') : t('numberChecker.single.check')}
                   </button>
                 </div>
 
@@ -412,33 +398,41 @@ export function NumberChecker() {
                     disabled={isCheckingSingle}
                   />
                   <span className="nc-checkbox-label">
-                    Auto-prefix <strong>+91</strong> for 10-digit numbers (keep 12-digit numbers as-is)
+                    <Trans i18nKey="numberChecker.single.autoPrefix" components={{ strong: <strong /> }} />
                   </span>
                 </label>
 
                 {phoneNumber.trim() && (
                   <div className="nc-format-preview">
-                    {phoneNumber.replace(/[^0-9]/g, '').length === 10 &&
-                    singleFormattedNumber === '91' + phoneNumber.replace(/[^0-9]/g, '') ? (
+                    {singleTypedDigits.length === 10 && singleFormattedNumber === '91' + singleTypedDigits ? (
                       <span className="nc-format-pill highlight">
-                        Will check as: <strong>+{singleFormattedNumber}</strong> (10 digits &rarr; auto-prefixed with
-                        91)
+                        <Trans
+                          i18nKey="numberChecker.preview.prefixed"
+                          values={{ number: singleFormattedNumber }}
+                          components={{ strong: <strong dir="ltr" /> }}
+                        />
                       </span>
-                    ) : phoneNumber.replace(/[^0-9]/g, '').length === 12 ? (
+                    ) : singleFormattedNumber.length === 12 && singleFormattedNumber === singleTypedDigits ? (
                       <span className="nc-format-pill">
-                        Will check as: <strong>+{singleFormattedNumber}</strong> (12 digits &rarr; kept as-is)
+                        <Trans
+                          i18nKey="numberChecker.preview.kept"
+                          values={{ number: singleFormattedNumber }}
+                          components={{ strong: <strong dir="ltr" /> }}
+                        />
                       </span>
                     ) : (
                       <span className="nc-format-pill">
-                        Will check as: <strong>+{singleFormattedNumber}</strong> ({singleFormattedNumber.length} digits)
+                        <Trans
+                          i18nKey="numberChecker.preview.digits"
+                          values={{ number: singleFormattedNumber, digits: singleFormattedNumber.length }}
+                          components={{ strong: <strong dir="ltr" /> }}
+                        />
                       </span>
                     )}
                   </div>
                 )}
                 <span className="nc-hint">
-                  {autoPrefix91
-                    ? '10-digit numbers automatically get +91 prepended. 12-digit numbers remain unchanged.'
-                    : 'Numbers are checked exactly as entered.'}
+                  {autoPrefix91 ? t('numberChecker.prefixHint.single') : t('numberChecker.prefixHint.off')}
                 </span>
               </div>
 
@@ -447,38 +441,43 @@ export function NumberChecker() {
                   <Shield size={20} />
                 </div>
                 <div className="nc-alert-content" style={{ fontSize: '0.8125rem' }}>
-                  <strong>Completely Silent:</strong> This query queries WhatsApp&apos;s registration registry directly.
-                  The contact receives no notification, sound, or message.
+                  <Trans i18nKey="numberChecker.single.silent" components={{ strong: <strong /> }} />
                 </div>
               </div>
             </div>
 
-            {/* Result Card */}
-            <div className="nc-card">
-              <h2 className="nc-card-title">Verification Result</h2>
+            {/* Result Card: always rendered, so a finished check is announced as a change inside it. */}
+            <div className="nc-card" role="status">
+              <h2 className="nc-card-title">{t('numberChecker.single.resultTitle')}</h2>
 
               {isCheckingSingle ? (
                 <div className="nc-result-placeholder">
-                  <Loader2 size={36} className="animate-spin" style={{ color: 'var(--primary)' }} />
-                  <span>Querying WhatsApp servers...</span>
+                  <Loader2 size={36} className="animate-spin" style={{ color: 'var(--primary-text)' }} />
+                  <span>{t('numberChecker.single.querying')}</span>
                 </div>
               ) : singleResult ? (
                 <div className={`nc-result-card ${singleResult.exists ? 'success' : 'not-found'}`}>
                   <div className="nc-result-top">
                     {singleResult.avatarUrl ? (
-                      <img src={singleResult.avatarUrl} alt="Avatar" className="nc-avatar" />
+                      <img
+                        src={singleResult.avatarUrl}
+                        alt={t('numberChecker.result.avatarAlt')}
+                        className="nc-avatar"
+                      />
                     ) : (
                       <div className="nc-avatar-fallback">{singleResult.exists ? 'WA' : '?'}</div>
                     )}
                     <div className="nc-result-header-text">
-                      <div className="nc-result-phone">+{singleResult.number}</div>
+                      <div className="nc-result-phone">
+                        <bdi dir="ltr">+{singleResult.number}</bdi>
+                      </div>
                       {singleResult.exists ? (
                         <span className="nc-status-badge registered">
-                          <CheckCircle2 size={15} /> Registered on WhatsApp
+                          <CheckCircle2 size={15} /> {t('numberChecker.result.registered')}
                         </span>
                       ) : (
                         <span className="nc-status-badge unregistered">
-                          <XCircle size={15} /> Not Registered
+                          <XCircle size={15} /> {t('numberChecker.result.notRegistered')}
                         </span>
                       )}
                     </div>
@@ -486,33 +485,33 @@ export function NumberChecker() {
 
                   <div className="nc-details-grid">
                     <div className="nc-detail-row">
-                      <span className="nc-detail-label">Status</span>
+                      <span className="nc-detail-label">{t('numberChecker.result.status')}</span>
                       <span className="nc-detail-value" style={{ fontFamily: 'inherit' }}>
-                        {singleResult.exists ? 'Active Account' : 'No Account Found'}
+                        {singleResult.exists ? t('numberChecker.result.active') : t('numberChecker.result.none')}
                       </span>
                     </div>
 
                     {singleResult.exists && singleResult.whatsappId && (
                       <div className="nc-detail-row">
-                        <span className="nc-detail-label">WhatsApp JID</span>
+                        <span className="nc-detail-label">{t('numberChecker.result.jid')}</span>
                         <span className="nc-detail-value">
-                          {singleResult.whatsappId}
+                          <bdi dir="ltr">{singleResult.whatsappId}</bdi>
                           <button
                             className="nc-copy-btn"
                             onClick={() => handleCopy(singleResult.whatsappId!)}
-                            title="Copy JID"
+                            title={t('numberChecker.result.copyJid')}
                           >
                             {copiedId ? <Check size={12} /> : <Copy size={12} />}
-                            {copiedId ? 'Copied' : 'Copy'}
+                            {copiedId ? t('numberChecker.result.copied') : t('numberChecker.result.copy')}
                           </button>
                         </span>
                       </div>
                     )}
 
                     <div className="nc-detail-row">
-                      <span className="nc-detail-label">Checked At</span>
+                      <span className="nc-detail-label">{t('numberChecker.result.checkedAt')}</span>
                       <span className="nc-detail-value" style={{ fontFamily: 'inherit', fontWeight: 'normal' }}>
-                        {singleResult.timestamp}
+                        <bdi>{timeOfDay(singleResult.timestamp)}</bdi>
                       </span>
                     </div>
                   </div>
@@ -524,7 +523,7 @@ export function NumberChecker() {
                         style={{ flex: 1 }}
                         onClick={() => navigate('/message-tester')}
                       >
-                        <Send size={16} /> Open in Message Tester
+                        <Send size={16} /> {t('numberChecker.result.openTester')}
                       </button>
                     </div>
                   )}
@@ -532,7 +531,7 @@ export function NumberChecker() {
               ) : (
                 <div className="nc-result-placeholder">
                   <UserCheck size={40} />
-                  <span>Enter a phone number on the left and click &quot;Check&quot; to see its WhatsApp status.</span>
+                  <span>{t('numberChecker.single.empty')}</span>
                 </div>
               )}
             </div>
@@ -543,75 +542,86 @@ export function NumberChecker() {
             <div className="nc-history-card">
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                 <h2 className="nc-card-title" style={{ margin: 0 }}>
-                  Recent Checks
+                  {t('numberChecker.recent.title')}
                 </h2>
                 <button
                   className="nc-btn nc-btn-secondary"
                   style={{ padding: '0.4rem 0.8rem', fontSize: '0.8125rem' }}
                   onClick={() => setRecentChecks([])}
                 >
-                  <Trash2 size={14} /> Clear History
+                  <Trash2 size={14} /> {t('numberChecker.recent.clear')}
                 </button>
               </div>
 
-              <table className="nc-history-table">
-                <thead>
-                  <tr>
-                    <th>Phone Number</th>
-                    <th>WhatsApp Status</th>
-                    <th>WhatsApp ID</th>
-                    <th>Time</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {recentChecks.map((item, idx) => (
-                    <tr key={`${item.number}-${idx}`}>
-                      <td style={{ fontWeight: 600 }}>+{item.number}</td>
-                      <td>
-                        {item.status === 'registered' ? (
-                          <span className="nc-status-badge registered">
-                            <CheckCircle2 size={13} /> Registered
-                          </span>
-                        ) : item.status === 'failed' ? (
-                          <span className="nc-status-badge error" title={item.error || 'Failed'}>
-                            <AlertCircle size={13} /> Failed
-                          </span>
-                        ) : (
-                          <span className="nc-status-badge unregistered">
-                            <XCircle size={13} /> Unregistered
-                          </span>
-                        )}
-                      </td>
-                      <td style={{ fontFamily: 'monospace', fontSize: '0.8125rem' }}>{item.whatsappId || '—'}</td>
-                      <td style={{ color: 'var(--text-muted)' }}>{item.timestamp}</td>
+              <div className="nc-table-wrap" tabIndex={0} role="region" aria-label={t('numberChecker.recent.title')}>
+                <table className="nc-history-table">
+                  <thead>
+                    <tr>
+                      <th>{t('numberChecker.table.phone')}</th>
+                      <th>{t('numberChecker.table.status')}</th>
+                      <th>{t('numberChecker.table.id')}</th>
+                      <th>{t('numberChecker.table.time')}</th>
                     </tr>
-                  ))}
-                </tbody>
-              </table>
+                  </thead>
+                  <tbody>
+                    {recentChecks.map((item, idx) => (
+                      <tr key={`${item.number}-${idx}`}>
+                        <td style={{ fontWeight: 600 }}>
+                          <bdi dir="ltr">+{item.number}</bdi>
+                        </td>
+                        <td>
+                          {item.status === 'registered' ? (
+                            <span className="nc-status-badge registered">
+                              <CheckCircle2 size={13} /> {t('numberChecker.status.registered')}
+                            </span>
+                          ) : item.status === 'failed' ? (
+                            <span
+                              className="nc-status-badge error"
+                              title={item.error || t('numberChecker.status.failed')}
+                            >
+                              <AlertCircle size={13} /> {t('numberChecker.status.failed')}
+                            </span>
+                          ) : (
+                            <span className="nc-status-badge unregistered">
+                              <XCircle size={13} /> {t('numberChecker.status.unregistered')}
+                            </span>
+                          )}
+                        </td>
+                        <td style={{ fontFamily: 'monospace', fontSize: '0.8125rem' }}>
+                          <bdi dir="ltr">{item.whatsappId || '-'}</bdi>
+                        </td>
+                        <td style={{ color: 'var(--text-muted)' }}>
+                          <bdi>{timeOfDay(item.timestamp)}</bdi>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
             </div>
           )}
         </>
       ) : (
         /* Batch / Bulk Number Checker Tab */
         <div className="nc-card">
-          <h2 className="nc-card-title">Bulk Number Checker</h2>
+          <h2 className="nc-card-title">{t('numberChecker.bulk.title')}</h2>
 
           <div className="nc-grid" style={{ marginBottom: '1.5rem' }}>
             <div>
               <div className="nc-form-group">
                 <label htmlFor="nc-batch-session" className="nc-label">
-                  WhatsApp Session
+                  {t('numberChecker.session.label')}
                 </label>
                 <select
                   id="nc-batch-session"
-                  aria-label="WhatsApp Session"
+                  aria-label={t('numberChecker.session.label')}
                   className="nc-input"
-                  value={currentSession}
+                  value={shownSession}
                   onChange={e => setSelectedSession(e.target.value)}
                   disabled={readySessions.length === 0 || isCheckingBatch}
                 >
                   {readySessions.length === 0 ? (
-                    <option value="">No ready sessions available</option>
+                    <option value="">{t('numberChecker.session.none')}</option>
                   ) : (
                     readySessions.map(s => (
                       <option key={s.id} value={s.id}>
@@ -624,28 +634,25 @@ export function NumberChecker() {
 
               <div className="nc-form-group">
                 <label htmlFor="nc-batch-delay" className="nc-label">
-                  Safe Pacing Delay (ms)
+                  {t('numberChecker.bulk.delayLabel')}
                 </label>
                 <select
                   id="nc-batch-delay"
-                  aria-label="Safe Pacing Delay (ms)"
+                  aria-label={t('numberChecker.bulk.delayLabel')}
                   className="nc-input"
                   value={batchDelay}
                   onChange={e => setBatchDelay(Number(e.target.value))}
                   disabled={isCheckingBatch}
                 >
-                  <option value={500}>500 ms (Fast)</option>
-                  <option value={1000}>1000 ms / 1 sec (Recommended)</option>
-                  <option value={2000}>2000 ms / 2 sec (Extra Safe)</option>
-                  <option value={3000}>3000 ms / 3 sec (High Volume Safe)</option>
+                  <option value={1000}>{t('numberChecker.bulk.delay1')}</option>
+                  <option value={2000}>{t('numberChecker.bulk.delay2')}</option>
+                  <option value={3000}>{t('numberChecker.bulk.delay3')}</option>
                 </select>
-                <span className="nc-hint">
-                  Adds spacing between consecutive queries to prevent WhatsApp rate limits.
-                </span>
+                <span className="nc-hint">{t('numberChecker.bulk.delayHint')}</span>
               </div>
 
               <div className="nc-form-group">
-                <label className="nc-label">Country Code Rule</label>
+                <label className="nc-label">{t('numberChecker.bulk.countryRule')}</label>
                 <label className="nc-checkbox-group" style={{ marginTop: 0 }}>
                   <input
                     type="checkbox"
@@ -655,21 +662,25 @@ export function NumberChecker() {
                     disabled={isCheckingBatch}
                   />
                   <span className="nc-checkbox-label">
-                    Auto-prefix <strong>+91</strong> (India) for 10-digit numbers
+                    <Trans i18nKey="numberChecker.bulk.autoPrefix" components={{ strong: <strong /> }} />
                   </span>
                 </label>
                 <span className="nc-hint">
-                  10-digit numbers (e.g. 96...) will get +91 prepended. 12-digit numbers will be checked as-is.
+                  {autoPrefix91 ? t('numberChecker.prefixHint.bulk') : t('numberChecker.prefixHint.off')}
                 </span>
               </div>
             </div>
 
             <div>
               <div className="nc-form-group">
-                <label className="nc-label">Numbers to Check (One per line or comma-separated)</label>
+                <label htmlFor="nc-batch-numbers" className="nc-label">
+                  {t('numberChecker.bulk.numbersLabel')}
+                </label>
                 <textarea
+                  id="nc-batch-numbers"
+                  dir="ltr"
                   className="nc-textarea"
-                  placeholder="9612345678 (10 digits)&#10;919612345678 (12 digits)&#10;14155552671"
+                  placeholder="919612345678&#10;6281234567890&#10;14155552671"
                   value={batchInput}
                   onChange={e => setBatchInput(e.target.value)}
                   disabled={isCheckingBatch}
@@ -677,54 +688,93 @@ export function NumberChecker() {
                 {batchInput.trim() ? (
                   <div className="nc-batch-parse-summary">
                     <span>
-                      📋 <strong>{batchParsedStats.uniqueCount}</strong> unique numbers parsed
+                      📋{' '}
+                      <Trans
+                        i18nKey="numberChecker.bulk.parsed"
+                        count={batchParsedStats.uniqueCount}
+                        components={{ strong: <strong /> }}
+                      />
                     </span>
                     {autoPrefix91 && (
                       <span className="nc-badge-sub">
-                        ({batchParsedStats.tenDigitsCount} ten-digit &rarr; +91 added
                         {batchParsedStats.twelveDigitsCount > 0
-                          ? `, ${batchParsedStats.twelveDigitsCount} twelve-digit preserved`
-                          : ''}
-                        )
+                          ? t('numberChecker.bulk.tenDigitAddedPreserved', {
+                              ten: batchParsedStats.tenDigitsCount,
+                              twelve: batchParsedStats.twelveDigitsCount,
+                            })
+                          : t('numberChecker.bulk.tenDigitAdded', { ten: batchParsedStats.tenDigitsCount })}
                       </span>
                     )}
                   </div>
                 ) : (
                   <span className="nc-hint">
-                    Paste raw 10-digit or 12-digit phone numbers. One per line or comma-separated.
+                    {t('numberChecker.bulk.numbersHint', { max: NUMBER_CHECK_BATCH_MAX })}
+                  </span>
+                )}
+                {batchOverLimit && (
+                  <span className="nc-batch-limit" role="status">
+                    {t('numberChecker.bulk.tooMany', {
+                      parsed: batchParsedStats.uniqueCount,
+                      max: NUMBER_CHECK_BATCH_MAX,
+                      excess: batchParsedStats.uniqueCount - NUMBER_CHECK_BATCH_MAX,
+                    })}
                   </span>
                 )}
               </div>
             </div>
           </div>
 
-          <div style={{ display: 'flex', gap: '0.75rem', marginBottom: '1.5rem' }}>
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.75rem', marginBottom: '1.5rem' }}>
             {!isCheckingBatch ? (
               <button
                 className="nc-btn nc-btn-primary"
                 onClick={handleStartBatch}
-                disabled={!canWrite || !batchInput.trim() || readySessions.length === 0}
+                disabled={!canWrite || !batchInput.trim() || readySessions.length === 0 || batchOverLimit}
               >
-                <UserCheck size={18} /> Start Batch Check
+                <UserCheck size={18} /> {t('numberChecker.bulk.start')}
               </button>
             ) : (
-              <button className="nc-btn nc-btn-danger" onClick={handleStopBatch}>
-                <Trash2 size={18} /> Stop Checking
+              <button className="nc-btn nc-btn-danger" onClick={run.stop}>
+                <Trash2 size={18} /> {t('numberChecker.bulk.stop')}
               </button>
             )}
 
             {batchResults.length > 0 && !isCheckingBatch && (
-              <button className="nc-btn nc-btn-secondary" onClick={handleExportCSV}>
-                <Download size={18} /> Export Results (CSV)
-              </button>
+              <>
+                <button className="nc-btn nc-btn-secondary" onClick={handleExportCSV} aria-describedby="nc-export-hint">
+                  <Download size={18} /> {t('numberChecker.bulk.export')}
+                </button>
+                <span id="nc-export-hint" className="nc-hint" style={{ flexBasis: '100%', margin: 0 }}>
+                  {t('numberChecker.bulk.exportHint')}
+                </span>
+              </>
             )}
           </div>
+
+          {batchStop && (
+            <div className="nc-alert warning nc-batch-stopped">
+              <div className="nc-alert-icon">
+                <AlertCircle size={22} />
+              </div>
+              <div className="nc-alert-content">
+                <strong>{t('numberChecker.bulk.stoppedTitle')}</strong>
+                <p style={{ margin: '0.25rem 0 0' }}>{batchStopMessage(t, batchStop)}</p>
+              </div>
+            </div>
+          )}
 
           {/* Progress & Counters */}
           {(isCheckingBatch || batchResults.length > 0) && (
             <>
               {isCheckingBatch && (
-                <div className="nc-progress-bar-container">
+                <div
+                  className="nc-progress-bar-container"
+                  role="progressbar"
+                  aria-label={t('numberChecker.bulk.title')}
+                  aria-valuemin={0}
+                  aria-valuemax={batchProgress.total}
+                  aria-valuenow={batchProgress.current}
+                >
                   <div
                     className="nc-progress-bar"
                     style={{
@@ -737,31 +787,31 @@ export function NumberChecker() {
               <div className="nc-batch-stats">
                 <div className="nc-stat-box">
                   <div className="nc-stat-number">{batchResults.length}</div>
-                  <div className="nc-stat-label">Checked</div>
+                  <div className="nc-stat-label">{t('numberChecker.bulk.checked')}</div>
                 </div>
                 <div className="nc-stat-box">
                   <div className="nc-stat-number" style={{ color: 'var(--success-text)' }}>
                     {registeredCount}
                   </div>
-                  <div className="nc-stat-label">Registered</div>
+                  <div className="nc-stat-label">{t('numberChecker.status.registered')}</div>
                 </div>
                 <div className="nc-stat-box">
                   <div className="nc-stat-number" style={{ color: 'var(--text-secondary)' }}>
                     {unregisteredCount}
                   </div>
-                  <div className="nc-stat-label">Not Registered</div>
+                  <div className="nc-stat-label">{t('numberChecker.status.notRegistered')}</div>
                 </div>
                 {failedCount > 0 && (
                   <div className="nc-stat-box">
                     <div className="nc-stat-number" style={{ color: 'var(--error-text)' }}>
                       {failedCount}
                     </div>
-                    <div className="nc-stat-label">Failed</div>
+                    <div className="nc-stat-label">{t('numberChecker.status.failed')}</div>
                   </div>
                 )}
                 <div className="nc-stat-box">
                   <div className="nc-stat-number">{Math.max(0, batchProgress.total - batchProgress.current)}</div>
-                  <div className="nc-stat-label">Remaining</div>
+                  <div className="nc-stat-label">{t('numberChecker.bulk.remaining')}</div>
                 </div>
               </div>
 
@@ -769,84 +819,99 @@ export function NumberChecker() {
               <div className="nc-filter-bar">
                 <div className="nc-filter-btns">
                   <button
+                    aria-pressed={batchFilter === 'all'}
                     className={`nc-filter-btn ${batchFilter === 'all' ? 'active' : ''}`}
                     onClick={() => setBatchFilter('all')}
                   >
-                    All ({batchResults.length})
+                    {t('numberChecker.bulk.all')} ({batchResults.length})
                   </button>
                   <button
+                    aria-pressed={batchFilter === 'registered'}
                     className={`nc-filter-btn ${batchFilter === 'registered' ? 'active' : ''}`}
                     onClick={() => setBatchFilter('registered')}
                   >
-                    Registered ({registeredCount})
+                    {t('numberChecker.status.registered')} ({registeredCount})
                   </button>
                   <button
+                    aria-pressed={batchFilter === 'unregistered'}
                     className={`nc-filter-btn ${batchFilter === 'unregistered' ? 'active' : ''}`}
                     onClick={() => setBatchFilter('unregistered')}
                   >
-                    Not Registered ({unregisteredCount})
+                    {t('numberChecker.status.notRegistered')} ({unregisteredCount})
                   </button>
                   {failedCount > 0 && (
                     <button
+                      aria-pressed={batchFilter === 'failed'}
                       className={`nc-filter-btn ${batchFilter === 'failed' ? 'active' : ''}`}
                       onClick={() => setBatchFilter('failed')}
                     >
-                      Failed ({failedCount})
+                      {t('numberChecker.status.failed')} ({failedCount})
                     </button>
                   )}
                 </div>
               </div>
 
-              <table className="nc-history-table">
-                <thead>
-                  <tr>
-                    <th>#</th>
-                    <th>Phone Number</th>
-                    <th>WhatsApp Status</th>
-                    <th>WhatsApp ID</th>
-                    <th>Time</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {filteredBatchResults.map((item, idx) => (
-                    <tr key={`${item.number}-${idx}`}>
-                      <td style={{ color: 'var(--text-muted)' }}>{idx + 1}</td>
-                      <td style={{ fontWeight: 600 }}>+{item.number}</td>
-                      <td>
-                        {item.status === 'registered' ? (
-                          <span className="nc-status-badge registered">
-                            <CheckCircle2 size={13} /> Registered
-                          </span>
-                        ) : item.status === 'failed' ? (
-                          <div style={{ display: 'inline-flex', flexDirection: 'column', gap: '0.25rem' }}>
-                            <span className="nc-status-badge error" title={item.error || 'Lookup failed'}>
-                              <AlertCircle size={13} /> Failed
-                            </span>
-                            {item.error && (
-                              <span
-                                style={{
-                                  fontSize: '0.75rem',
-                                  color: 'var(--error-text)',
-                                  maxWidth: '240px',
-                                  wordBreak: 'break-word',
-                                }}
-                              >
-                                {item.error}
-                              </span>
-                            )}
-                          </div>
-                        ) : (
-                          <span className="nc-status-badge unregistered">
-                            <XCircle size={13} /> Unregistered
-                          </span>
-                        )}
-                      </td>
-                      <td style={{ fontFamily: 'monospace', fontSize: '0.8125rem' }}>{item.whatsappId || '—'}</td>
-                      <td style={{ color: 'var(--text-muted)' }}>{item.timestamp}</td>
+              <div className="nc-table-wrap" tabIndex={0} role="region" aria-label={t('numberChecker.bulk.title')}>
+                <table className="nc-history-table">
+                  <thead>
+                    <tr>
+                      <th>#</th>
+                      <th>{t('numberChecker.table.phone')}</th>
+                      <th>{t('numberChecker.table.status')}</th>
+                      <th>{t('numberChecker.table.id')}</th>
+                      <th>{t('numberChecker.table.time')}</th>
                     </tr>
-                  ))}
-                </tbody>
-              </table>
+                  </thead>
+                  <tbody>
+                    {filteredBatchResults.map((item, idx) => (
+                      <tr key={`${item.number}-${idx}`}>
+                        <td style={{ color: 'var(--text-muted)' }}>{idx + 1}</td>
+                        <td style={{ fontWeight: 600 }}>
+                          <bdi dir="ltr">+{item.number}</bdi>
+                        </td>
+                        <td>
+                          {item.status === 'registered' ? (
+                            <span className="nc-status-badge registered">
+                              <CheckCircle2 size={13} /> {t('numberChecker.status.registered')}
+                            </span>
+                          ) : item.status === 'failed' ? (
+                            <div style={{ display: 'inline-flex', flexDirection: 'column', gap: '0.25rem' }}>
+                              <span
+                                className="nc-status-badge error"
+                                title={item.error || t('numberChecker.toast.lookupFailed')}
+                              >
+                                <AlertCircle size={13} /> {t('numberChecker.status.failed')}
+                              </span>
+                              {item.error && (
+                                <span
+                                  style={{
+                                    fontSize: '0.75rem',
+                                    color: 'var(--error-text)',
+                                    maxWidth: '240px',
+                                    wordBreak: 'break-word',
+                                  }}
+                                >
+                                  {item.error}
+                                </span>
+                              )}
+                            </div>
+                          ) : (
+                            <span className="nc-status-badge unregistered">
+                              <XCircle size={13} /> {t('numberChecker.status.unregistered')}
+                            </span>
+                          )}
+                        </td>
+                        <td style={{ fontFamily: 'monospace', fontSize: '0.8125rem' }}>
+                          <bdi dir="ltr">{item.whatsappId || '-'}</bdi>
+                        </td>
+                        <td style={{ color: 'var(--text-muted)' }}>
+                          <bdi>{timeOfDay(item.timestamp)}</bdi>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
             </>
           )}
         </div>

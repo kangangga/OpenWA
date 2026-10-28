@@ -15,7 +15,7 @@ import { ShutdownService } from '../../common/services/shutdown.service';
 import { ConfigService } from '@nestjs/config';
 import { captureSessionWrites, SessionWriteScope } from '../../common/utils/session-write-scope';
 import { InjectRepository } from '@nestjs/typeorm';
-import { In, IsNull, Not, QueryDeepPartialEntity, Repository } from 'typeorm';
+import { In, IsNull, Not, QueryDeepPartialEntity, Repository, EntityManager } from 'typeorm';
 import { createHash, randomUUID } from 'crypto';
 import { setTimeout } from 'node:timers/promises';
 import {
@@ -26,6 +26,8 @@ import {
   BatchMessageResult,
 } from './entities/message-batch.entity';
 import { SendBulkMessageDto } from './dto/bulk-message.dto';
+import { MENTIONS_MAX, MENTION_WID_MAX_LENGTH } from './dto/send-message.dto';
+import { isMentionWid } from './dto/is-mention-wid.validator';
 import { isMediaUrl } from '../../common/media/media-url';
 import { MessageStatus } from './entities/message.entity';
 import { EngineRegistry } from '../../engine/engine-registry.service';
@@ -40,9 +42,10 @@ import {
 } from './send-pacing.service';
 import { SessionOwnershipService } from '../session/session-ownership.service';
 import { HookManager } from '../../core/hooks';
-import { assertBase64WithinMediaCap, stripBase64DataUri } from './media-cap.util';
+import { assertBase64LengthWithinMediaCap, assertBase64WithinMediaCap, stripBase64DataUri } from './media-cap.util';
+import { stripBatchMediaPayloads } from './batch-media.util';
 import { SsrfBlockedError, SSRF_BLOCKED_CLIENT_MESSAGE } from '../../common/security/ssrf-guard';
-import { renderTemplate } from '../../common/utils/template-render';
+import { renderedLength, renderTemplate, TemplateRenderError } from '../../common/utils/template-render';
 import { IWhatsAppEngine, MessageResult } from '../../engine/interfaces/whatsapp-engine.interface';
 import { resolveNonNegativeIntEnv } from '../../config/configuration';
 import { EngineNotReadyError } from '../../common/errors/engine-not-ready.error';
@@ -154,7 +157,10 @@ export class BulkMessageService implements OnModuleInit, OnApplicationBootstrap,
    * Registered here, before any bootstrap hook can start a session.
    */
   onModuleInit(): void {
-    this.ownership?.onAdoption(sessionId => this.reapProcessingBatches(sessionId, 'session taken from a lapsed node'));
+    this.ownership?.onAdoption(
+      (sessionId, manager) => this.reapProcessingBatches(sessionId, 'session taken from a lapsed node', manager),
+      true,
+    );
   }
 
   /**
@@ -222,10 +228,11 @@ export class BulkMessageService implements OnModuleInit, OnApplicationBootstrap,
   private async failOrphanedBatch(
     batch: Pick<MessageBatch, 'id'> & Partial<MessageBatch>,
     withRunState = false,
+    repository = this.batchRepository,
   ): Promise<boolean> {
     const set: QueryDeepPartialEntity<MessageBatch> = { status: BatchStatus.FAILED, completedAt: new Date() };
     if (batch.messages) {
-      this.stripBatchMediaPayloads(batch.messages);
+      stripBatchMediaPayloads(batch.messages);
       set.messages = batch.messages as QueryDeepPartialEntity<MessageBatch>['messages'];
     }
     if (withRunState) {
@@ -233,7 +240,7 @@ export class BulkMessageService implements OnModuleInit, OnApplicationBootstrap,
       if (batch.results) set.results = batch.results;
       if (batch.currentIndex !== undefined) set.currentIndex = batch.currentIndex;
     }
-    const failed = await this.batchRepository.update(
+    const failed = await repository.update(
       { id: batch.id, status: In([BatchStatus.PENDING, BatchStatus.PROCESSING]) },
       set,
     );
@@ -252,15 +259,16 @@ export class BulkMessageService implements OnModuleInit, OnApplicationBootstrap,
    * the session before or still runs a stale engine for it: createBatch registers every batch before
    * its row is written, so only the lapsed node's batches go.
    */
-  async reapProcessingBatches(sessionId: string, reason: string): Promise<number> {
+  async reapProcessingBatches(sessionId: string, reason: string, manager?: EntityManager): Promise<number> {
+    const repository = manager?.getRepository(MessageBatch) ?? this.batchRepository;
     const unfinished = (
-      await this.batchRepository.find({
+      await repository.find({
         where: { status: In([BatchStatus.PENDING, BatchStatus.PROCESSING]), sessionId },
       })
     ).filter(batch => !this.processingBatches.has(batch.id));
     let failed = 0;
     for (const batch of unfinished) {
-      if (await this.failOrphanedBatch(batch)) failed++;
+      if (await this.failOrphanedBatch(batch, false, repository)) failed++;
     }
     if (failed > 0) {
       this.logger.warn(`Marked ${failed} unfinished batch(es) FAILED for session ${sessionId} (${reason})`);
@@ -476,7 +484,7 @@ export class BulkMessageService implements OnModuleInit, OnApplicationBootstrap,
     batch.progress.cancelled = batch.progress.pending;
     batch.progress.pending = 0;
     batch.completedAt = new Date();
-    this.stripBatchMediaPayloads(batch.messages);
+    stripBatchMediaPayloads(batch.messages);
 
     const cancelledRows = await this.batchRepository.update(
       { id: batch.id, status: In([BatchStatus.PENDING, BatchStatus.PROCESSING]) },
@@ -577,7 +585,7 @@ export class BulkMessageService implements OnModuleInit, OnApplicationBootstrap,
   private async failBatchWithoutEngine(batch: MessageBatch): Promise<void> {
     batch.status = BatchStatus.FAILED;
     batch.completedAt = new Date();
-    this.stripBatchMediaPayloads(batch.messages);
+    stripBatchMediaPayloads(batch.messages);
     await this.batchRepository.update({ id: batch.id, status: Not(BatchStatus.CANCELLED) }, {
       status: BatchStatus.FAILED,
       completedAt: batch.completedAt,
@@ -724,7 +732,13 @@ export class BulkMessageService implements OnModuleInit, OnApplicationBootstrap,
 
       this.logger.debug(`Batch ${batch.batchId}: Sent message ${i + 1}/${batch.messages.length} to ${msg.chatId}`);
     } catch (error) {
-      if (!engineAsked) settleAdmission?.();
+      if (!engineAsked) {
+        settleAdmission?.();
+        // A session deleted under an item the engine was never asked to send is no delivery failure to
+        // count or report; the run stops here and the batch goes with the session (or is failed by the
+        // delete that did not complete).
+        lifetime.assertCurrent();
+      }
       result.status = BatchMessageStatus.FAILED;
       // Sanitize: an SSRF block names an internal address — never store/return/log it verbatim.
       const sanitized = sanitizeBatchError(error);
@@ -856,7 +870,7 @@ export class BulkMessageService implements OnModuleInit, OnApplicationBootstrap,
     batch.results = results;
     // The batch is terminal now (never resumed), so drop the base64 media payloads before persisting —
     // otherwise the message_batches row retains multi-MB media forever.
-    this.stripBatchMediaPayloads(batch.messages);
+    stripBatchMediaPayloads(batch.messages);
     const terminal = {
       status: batch.status,
       progress: cancelled ? cancelledProgress : batch.progress,
@@ -903,6 +917,20 @@ export class BulkMessageService implements OnModuleInit, OnApplicationBootstrap,
    * creation (a 400) and again per item after variables and the message:sending gate.
    */
   private assertItemContent(type: string, content: BulkMessageContent, beforeRender = false): void {
+    // A mention may be a placeholder until it is rendered, so the DTO accepts it unchecked. What is sent is
+    // held to the single-send rule: a malformed WID reaches the engine as an opaque failure otherwise.
+    const mentions = content?.mentions;
+    if (
+      !beforeRender &&
+      mentions != null &&
+      (!Array.isArray(mentions) ||
+        mentions.length > MENTIONS_MAX ||
+        Array.from(mentions).some(
+          wid => typeof wid !== 'string' || wid.length > MENTION_WID_MAX_LENGTH || !isMentionWid(wid),
+        ))
+    ) {
+      throw new BadRequestException('content.mentions must contain bounded individual WIDs');
+    }
     if (type === 'text') {
       if (typeof content?.text !== 'string' || !content.text) {
         throw new BadRequestException('A text item requires a non-empty content.text');
@@ -934,22 +962,6 @@ export class BulkMessageService implements OnModuleInit, OnApplicationBootstrap,
         throw new BadRequestException('Either url or base64 must be provided for bulk media');
       }
       assertBase64WithinMediaCap(base64);
-    }
-  }
-
-  /**
-   * Drop base64 payloads from a finished batch's stored message list. A completed/cancelled batch is
-   * terminal (never resumed), so the (often multi-MB) base64 in `message_batches.messages` is dead
-   * weight; the descriptive fields (mimetype/filename/caption/url) are kept.
-   */
-  private stripBatchMediaPayloads(messages: MessageBatch['messages']): void {
-    for (const m of messages ?? []) {
-      for (const key of ['image', 'video', 'audio', 'document']) {
-        const media = m.content[key] as { base64?: unknown } | undefined;
-        if (media && typeof media === 'object' && 'base64' in media) {
-          delete media.base64;
-        }
-      }
     }
   }
 
@@ -988,23 +1000,62 @@ export class BulkMessageService implements OnModuleInit, OnApplicationBootstrap,
       return value;
     };
 
-    const rendered = processValue(content) as BulkMessageContent;
+    // Sizes are measured before anything is rendered. One placeholder repeated through a small string
+    // multiplies a large variable (see renderedLength), so checking the finished text would mean
+    // allocating it first, for every string of the item at once.
+    const lengthOf = (str: string): number => {
+      try {
+        return renderedLength(str, variables);
+      } catch (error) {
+        throw error instanceof TemplateRenderError ? new BadRequestException(error.message) : error;
+      }
+    };
+    // The strings with a cap of their own, which the growth total below leaves out.
+    const hasOwnCap = /^(text|caption|(image|video|audio|document)\.base64)$/;
+    const forEachOtherString = (value: unknown, visit: (str: string) => void, path = ''): void => {
+      if (typeof value === 'string') {
+        if (!hasOwnCap.test(path)) visit(value);
+      } else if (Array.isArray(value)) {
+        value.forEach(item => forEachOtherString(item, visit, path));
+      } else if (typeof value === 'object' && value !== null) {
+        for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
+          forEachOtherString(item, visit, path ? `${path}.${key}` : key);
+        }
+      }
+    };
 
     // Cap the MESSAGE, not the payload. Substitution runs over the whole content tree (a URL or a
-    // filename may carry a placeholder too), but only the text-bearing fields are bounded: `base64`
-    // holds media, which `assertBase64WithinMediaCap` governs at up to MEDIA_DOWNLOAD_MAX_BYTES —
-    // three orders of magnitude above this cap. Capping every string rejected the most natural bulk
-    // request there is, a personalised media send, because a 100 KB image is ~137,000 base64
-    // characters.
+    // filename may carry a placeholder too), but this cap bounds the text-bearing fields: `base64` holds
+    // media, which has the media byte cap (MEDIA_DOWNLOAD_MAX_BYTES), three orders of magnitude above this
+    // one. Capping every string rejected the most natural bulk request there is, a personalised media send,
+    // because a 100 KB image is ~137,000 base64 characters.
     for (const field of ['text', 'caption'] as const) {
-      const value = rendered[field];
-      if (typeof value === 'string' && value.length > maxChars) {
+      const value = content[field];
+      const length = typeof value === 'string' ? lengthOf(value) : 0;
+      if (length > maxChars) {
         throw new BadRequestException(
-          `Rendered ${field} is ${value.length} characters, over the ${maxChars}-character limit`,
+          `Rendered ${field} is ${length} characters, over the ${maxChars}-character limit`,
         );
       }
     }
-    return rendered;
+    // Media is held to its own cap on the length it will render to: the exact check on the finished string
+    // (assertContentMediaWithinCap) runs after the render, which would already have built it.
+    for (const kind of ['image', 'video', 'audio', 'document'] as const) {
+      const base64 = content[kind]?.base64;
+      if (typeof base64 === 'string') assertBase64LengthWithinMediaCap(lengthOf(base64));
+    }
+    // The remaining strings (a URL, a filename) are not bounded one by one, but together they may not grow the
+    // item by more than the text cap.
+    let added = 0;
+    forEachOtherString(content, str => {
+      added += Math.max(0, lengthOf(str) - str.length);
+    });
+    if (added > maxChars) {
+      throw new BadRequestException(
+        `Rendered content grows by ${added} characters, over the ${maxChars}-character limit`,
+      );
+    }
+    return processValue(content) as BulkMessageContent;
   }
 
   /**

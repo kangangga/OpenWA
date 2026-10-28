@@ -16,7 +16,7 @@ import { PluginDto } from './dto/plugin.dto';
 import { redactSecretConfig, restoreSecretConfig } from './redact-config';
 import { parsePluginPackage } from './plugin-installer';
 import { assertDownloadSha256, assertPluginInstallUrl, fetchSafeBuffer } from './plugin-download';
-import { annotateCatalog, CatalogEntry, CatalogPlugin } from './catalog';
+import { annotateCatalog, CatalogEntry, CatalogPlugin, isCatalogEntry } from './catalog';
 import { redactSsrfError } from '../../common/security/ssrf-guard';
 import { createLogger } from '../../common/services/logger.service';
 
@@ -49,6 +49,13 @@ export class PluginsService {
   private readonly opChains = new Map<string, Promise<unknown>>();
 
   private serialize<T>(id: string, op: () => Promise<T>): Promise<T> {
+    // A boot restore that outlasted the boot wait enables plugins in the background, outside this chain, so a
+    // change to a plugin it has not finished with would interleave with its enable (see isRestorePending).
+    if (this.pluginLoader.isRestorePending(id)) {
+      return Promise.reject(
+        new ConflictException(`Plugin ${id} is still being restored after startup. Retry in a moment.`),
+      );
+    }
     const prior = this.opChains.get(id) ?? Promise.resolve();
     const next = prior.catch(() => undefined).then(op);
     this.opChains.set(id, next);
@@ -232,7 +239,9 @@ export class PluginsService {
     try {
       // The dashboard PUTs the whole (redacted) config back, so a sentinel secret means "unchanged":
       // restore the stored value instead of overwriting the real secret with the mask.
-      const merged = restoreSecretConfig(config, plugin.config, plugin.manifest.configSchema);
+      const merged = restoreSecretConfig(config, plugin.config, plugin.manifest.configSchema, {
+        mergedOverStored: true,
+      });
       this.pluginLoader.updatePluginConfig(id, merged);
       return { success: true, message: `Plugin ${id} configuration updated` };
     } catch (error) {
@@ -405,11 +414,21 @@ export class PluginsService {
    * means the package was substituted in transit and the install fails closed.
    */
   async installFromUrl(url: string): Promise<PluginDto> {
-    const buffer = await this.downloadPackage(url);
-    // Peek the id (the SSRF download stays outside the lock) so the install — which writes the plugin
-    // directory — is serialized against any concurrent uninstall/update of the same id.
-    const { manifest } = parsePluginPackage(buffer);
-    return this.serialize(manifest.id, () => Promise.resolve(this.install({ buffer })));
+    // The SSRF download stays outside the lock; the install itself takes it.
+    return this.installPackage({ buffer: await this.downloadPackage(url) });
+  }
+
+  /**
+   * {@link install} under the same per-id lock as uninstall and update. The id is peeked from the package
+   * first, so an install (which writes the plugin directory) cannot interleave with a teardown of that
+   * plugin that is still awaiting its takeovers, and then remove the files the install just wrote.
+   */
+  async installPackage(file?: { buffer?: Buffer }): Promise<PluginDto> {
+    if (!file?.buffer?.length) {
+      throw new BadRequestException('No plugin file uploaded');
+    }
+    const { manifest } = parsePluginPackage(file.buffer);
+    return this.serialize(manifest.id, () => Promise.resolve(this.install(file)));
   }
 
   /**
@@ -465,10 +484,10 @@ export class PluginsService {
     try {
       const parsed: unknown = JSON.parse(raw.toString('utf8'));
       if (!Array.isArray(parsed)) throw new Error('catalog is not a JSON array');
-      if (!parsed.every(e => typeof e === 'object' && e !== null && !Array.isArray(e))) {
-        throw new Error('catalog entries must be JSON objects');
+      if (!parsed.every(isCatalogEntry)) {
+        throw new Error('catalog entries must be JSON objects with a string id, name and version');
       }
-      entries = parsed as CatalogEntry[];
+      entries = parsed;
     } catch (error) {
       throw new BadRequestException(
         `Invalid plugin catalog JSON: ${error instanceof Error ? error.message : String(error)}`,
@@ -577,6 +596,28 @@ export class PluginsService {
           action: 'plugin_update_backup_restored',
         });
       }
+      // ctx.storage files share the package directory under shipped defaults. Carry them into the staged
+      // tree before the swap, so the live directory is complete the moment it takes the name: a crash after
+      // the swap must not leave state only in a backup that boot recovery drops once a live directory exists.
+      // Everything is carried unless the new package explicitly supplied that exact path: encoded key-* files
+      // and the legacy <key>.json files the storage service still reads (every top-level *.json except the
+      // package's manifest.json/package.json). Copy (rather than move) so the rollback below still has a
+      // complete original directory.
+      const packagePaths = new Set(entries.map(entry => entry.relPath));
+      for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+        if (
+          !entry.isFile() ||
+          !entry.name.endsWith('.json') ||
+          entry.name === 'manifest.json' ||
+          entry.name === 'package.json' ||
+          packagePaths.has(entry.name)
+        ) {
+          continue;
+        }
+        const stateFile = path.join(staging, entry.name);
+        fs.copyFileSync(path.join(dir, entry.name), stateFile);
+        fs.chmodSync(stateFile, 0o600);
+      }
       fs.rmSync(backup, { recursive: true, force: true });
       fs.renameSync(dir, backup);
       fs.renameSync(staging, dir);
@@ -603,26 +644,6 @@ export class PluginsService {
     });
 
     try {
-      // ctx.storage files share the package directory under shipped defaults. Restore state from the
-      // backup unless the new package explicitly supplied that exact path: encoded key-* files and the
-      // legacy <key>.json files the storage service still reads (every top-level *.json except the
-      // package's manifest.json/package.json). Copy (rather than move) so the rollback below still has
-      // a complete original directory.
-      const packagePaths = new Set(entries.map(entry => entry.relPath));
-      for (const entry of fs.readdirSync(backup, { withFileTypes: true })) {
-        if (
-          !entry.isFile() ||
-          !entry.name.endsWith('.json') ||
-          entry.name === 'manifest.json' ||
-          entry.name === 'package.json' ||
-          packagePaths.has(entry.name)
-        ) {
-          continue;
-        }
-        const stateFile = path.join(dir, entry.name);
-        fs.copyFileSync(path.join(backup, entry.name), stateFile);
-        fs.chmodSync(stateFile, 0o600);
-      }
       this.pluginLoader.loadPlugin(dir);
       // Shutdown may have begun while the old version was being stopped: roll back below rather than
       // keep the new version untested with its backup deleted.

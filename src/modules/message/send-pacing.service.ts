@@ -12,6 +12,7 @@ import { EngineNotSupportedError } from '../../common/errors/engine-not-supporte
 import { EngineThrottledError } from '../../common/errors/engine-throttled.error';
 import { EngineNotSentError } from '../../common/errors/engine-not-sent.error';
 import { SsrfBlockedError } from '../../common/security/ssrf-guard';
+import { toParticipantWid } from '../../engine/identity/wa-id';
 import { AuditService } from '../audit/audit.service';
 import { AuditAction } from '../audit/entities/audit-log.entity';
 
@@ -39,10 +40,12 @@ export function isPacingLimitedError(error: unknown): boolean {
  * open the breaker on a perfectly healthy session and 429 every send for the cooldown. The rule is
  * therefore: a client-fault or engine-state HTTP status (4xx/501/503) does NOT count; a refusal
  * WhatsApp itself returned — EngineRefusedError (403) — and anything unclassified (a raw engine
- * error, a timeout, a 5xx) does.
+ * error, a timeout, a 5xx) does. A rate limit WhatsApp answered (EngineThrottledError, a 503 on the wire)
+ * counts as well: it is WhatsApp refusing this account's traffic, the signal the breaker exists to act on,
+ * even though the send provably went nowhere (see sentNothing).
  */
 export function countsTowardSendBreaker(error: unknown): boolean {
-  if (error instanceof EngineRefusedError) return true;
+  if (error instanceof EngineRefusedError || error instanceof EngineThrottledError) return true;
   if (error instanceof SsrfBlockedError) return false;
   if (error instanceof HttpException) {
     const status = error.getStatus();
@@ -106,6 +109,8 @@ interface BreakerState {
 interface Admission {
   /** Epoch ms its own term ends: a window from its admission, or from its settle. */
   until: number;
+  /** An untilSettled caller still has no engine outcome to count in the persisted day. */
+  unsettled: boolean;
   /** Epoch ms it stops being held, so only its row counts from then on; refreshed by heldAdmissions. */
   heldUntil: number;
   /** Reset at UTC rollover, then filled from the first current-day count. */
@@ -271,9 +276,16 @@ export class SendPacingService {
     const sentToday = await this.messageRepository.count({
       where: { sessionId, direction: MessageDirection.OUTGOING, createdAt: MoreThanOrEqual(dayStart) },
     });
+    // A stale count must not reset the new day's held admissions.
+    if (startOfUtcDay(new Date()).getTime() !== dayStart.getTime()) {
+      return this.assertSendAllowed(sessionId, chatId, opts);
+    }
     // The overall cap is the cheaper check and bounds everything, so it settles before the cold probe.
     this.assertUnderDailyCap(sessionId, dayStart, ageDays, allowance, sentToday);
     const cold = await this.readColdReachouts(sessionId, chatId, dayStart, ageDays, config);
+    if (startOfUtcDay(new Date()).getTime() !== dayStart.getTime()) {
+      return this.assertSendAllowed(sessionId, chatId, opts);
+    }
 
     // Judged again, and admitted, with no await from here on: a concurrent request admitted while this
     // one was reading must count, and this one must count for the next.
@@ -291,6 +303,7 @@ export class SendPacingService {
         : Date.now() + (opts.untilSettled ? UNSETTLED_ADMISSION_MAX_MS : ADMISSION_WINDOW_MS);
       const admission: Admission = {
         until,
+        unsettled: opts.untilSettled === true,
         heldUntil: until,
         sentToday,
         cold: cold ? { key, coldToday: cold.coldToday } : null,
@@ -302,6 +315,7 @@ export class SendPacingService {
       return (mayHaveSent = false) => {
         if (settled) return;
         settled = true;
+        admission.unsettled = false;
         if (mayHaveSent) {
           admission.until = Date.now() + ADMISSION_WINDOW_MS;
           return;
@@ -338,17 +352,16 @@ export class SendPacingService {
   private heldAdmissions(sessionId: string, dayStart: Date): Admission[] {
     const hold = this.holds.get(sessionId);
     if (!hold) return [];
+    const now = Date.now();
     if (hold.dayStartMs !== dayStart.getTime()) {
-      // Preparing sends still have no row to count today. Keep their settlement identity and rebase
-      // their snapshots on the new day's first count; yesterday's finite holds have expired.
-      hold.admissions = hold.admissions.filter(a => a.until === Infinity);
+      // Preparations and engine calls still running may write today; completed yesterday's sends do not.
+      hold.admissions = hold.admissions.filter(a => a.until === Infinity || (a.unsettled && a.until > now));
       hold.dayStartMs = dayStart.getTime();
       for (const admission of hold.admissions) {
         admission.sentToday = null;
         if (admission.cold) admission.cold.coldToday = null;
       }
     }
-    const now = Date.now();
     // The cold terms lapse as a whole, once no cold admission's own term is running: a warm admission read no
     // cold count, so it cannot have missed a cold row, and letting it hold them would keep a cold send that
     // wrote no row counted for as long as warm sends keep arriving. Cleared rather than skipped, so a cold
@@ -398,7 +411,7 @@ export class SendPacingService {
     // The same id twice in one request is one contact, and must cost one. Each contact is probed
     // under both user-id dialects (see dialectVariants) — a contact known under the other spelling
     // is not a stranger.
-    const unique = [...new Set(contactIds)];
+    const unique = [...new Set(contactIds.map(toParticipantWid))];
     const variantsByContact = new Map(unique.map(id => [id, dialectVariants(id)]));
     const knownRows = await this.messageRepository
       .createQueryBuilder('m')

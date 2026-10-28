@@ -68,6 +68,45 @@ describe('PluginsService — install / uninstall (real loader + disk)', () => {
     expect(() => service.install({ buffer: Buffer.alloc(0) })).toThrow(/no plugin file/i);
   });
 
+  it('installPackage installs like install and refuses an empty upload', async () => {
+    await expect(service.installPackage({ buffer: Buffer.alloc(0) })).rejects.toThrow(/no plugin file/i);
+
+    const dto = await service.installPackage({ buffer: pkg() });
+
+    expect(dto.id).toBe('svc-plg');
+    expect(loader.getPlugin('svc-plg')).toBeDefined();
+  });
+
+  // An uninstall awaits the plugin's takeovers before it removes the files, and an upload that landed in
+  // that window wrote a directory the teardown then deleted from under the freshly loaded plugin.
+  it('installPackage waits for an uninstall of the same id that is still running', async () => {
+    service.install({ buffer: pkg() });
+    let finish!: () => void;
+    jest.spyOn(service as unknown as { uninstallInner: () => Promise<unknown> }, 'uninstallInner').mockImplementation(
+      () =>
+        new Promise(resolve => {
+          finish = () => resolve({ success: true, message: 'ok' });
+        }),
+    );
+    const install = jest.spyOn(service, 'install');
+
+    const uninstalling = service.uninstall('svc-plg');
+    const reinstalling = service.installPackage({ buffer: pkg() });
+    const outcome = reinstalling.then(
+      () => 'installed',
+      (error: Error) => error.message,
+    );
+    await new Promise(resolve => setImmediate(resolve));
+    expect(install).not.toHaveBeenCalled();
+
+    finish();
+    await uninstalling;
+
+    // The mocked uninstall removed nothing, so the install that ran after it finds the plugin and refuses.
+    await expect(outcome).resolves.toMatch(/already installed/i);
+    expect(install).toHaveBeenCalledTimes(1);
+  });
+
   it('rejects a duplicate install (already installed)', () => {
     service.install({ buffer: pkg() });
     expect(() => service.install({ buffer: pkg() })).toThrow(/already installed/i);
@@ -120,6 +159,25 @@ describe('PluginsService — install / uninstall (real loader + disk)', () => {
     if (process.platform !== 'win32') {
       expect(fs.statSync(path.join(pluginsDir, 'svc-plg', stateFile as string)).mode & 0o777).toBe(0o600);
     }
+  });
+
+  it('has the plugin state in the live directory the moment the update swaps it in', async () => {
+    // Boot recovery drops the backup once a live directory exists, so state that is copied after the swap
+    // is lost by a crash between the two. Observe the live directory right after the staging rename.
+    service.install({ buffer: pkg({ version: '1.0.0' }) });
+    await pluginStorage.createPluginStorage('svc-plg').set('cursor', { lastId: 'msg-42' });
+    const live = path.join(pluginsDir, 'svc-plg');
+    const realRename = fs.renameSync.bind(fs);
+    let atSwap: string[] | undefined;
+    const rename = jest.spyOn(fs, 'renameSync').mockImplementation((from, to) => {
+      realRename(from, to);
+      if (to === live && String(from).endsWith('.svc-plg.new')) atSwap = fs.readdirSync(live);
+    });
+
+    await service.updatePackage('svc-plg', pkg({ version: '2.0.0' }));
+    rename.mockRestore();
+
+    expect(atSwap).toEqual(expect.arrayContaining([expect.stringMatching(/^key-.*\.json$/)]));
   });
 
   it('preserves a legacy (pre-encoding) ctx.storage file across an in-place package update', async () => {
@@ -640,6 +698,29 @@ describe('PluginsService — per-session config', () => {
     expect(loader.getPlugin('sess-cfg')?.sessionConfig?.['sess-A']).toEqual({ apiKey: 'A-secret', lang: 'en' });
   });
 
+  // A write is merged over the stored base config, so a removed secret has to travel as null; an empty
+  // string is not a removal.
+  it('removes the base secret on an explicit null and keeps it on an empty string', () => {
+    service.updateConfig('sess-cfg', { apiKey: 'BASE', lang: 'en' });
+
+    service.updateConfig('sess-cfg', { apiKey: '', lang: 'de' });
+    expect(loader.getPlugin('sess-cfg')?.config).toEqual({ apiKey: 'BASE', lang: 'de' });
+
+    expect(service.updateConfig('sess-cfg', { apiKey: null }).success).toBe(true);
+    expect(loader.getPlugin('sess-cfg')?.config).toEqual({ apiKey: null, lang: 'de' });
+    expect(service.findOne('sess-cfg').config).toEqual({ apiKey: null, lang: 'de' });
+  });
+
+  // The override slice replaces the stored one, and a session without its own secret inherits the base.
+  it('drops a per-session secret sent as null, so the session inherits the base one', () => {
+    service.updateConfig('sess-cfg', { apiKey: 'BASE' });
+    service.updateSessionConfig('sess-cfg', 'sess-A', { apiKey: 'A-secret', lang: 'he' });
+
+    service.updateSessionConfig('sess-cfg', 'sess-A', { apiKey: null, lang: 'he' });
+
+    expect(loader.getPlugin('sess-cfg')?.sessionConfig?.['sess-A']).toEqual({ lang: 'he' });
+  });
+
   it('keeps the base config and per-session overrides independent', () => {
     service.updateConfig('sess-cfg', { apiKey: 'BASE', lang: 'en' });
     service.updateSessionConfig('sess-cfg', 'sess-A', { apiKey: 'A-secret', lang: 'he' });
@@ -797,6 +878,70 @@ describe('PluginsService — disable when the plugin is not loaded', () => {
   it('still throws NotFound for an id with no registry entry at all', async () => {
     const { service } = build();
     await expect(service.disable('never-installed')).rejects.toThrow(/not found/i);
+  });
+});
+
+describe('PluginsService: a plugin the boot restore has not finished with', () => {
+  let tmpDir: string;
+  let pluginsDir: string;
+  let config: ConfigService;
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'owa-pending-'));
+    pluginsDir = path.join(tmpDir, 'plugins');
+    fs.mkdirSync(pluginsDir, { recursive: true });
+    config = {
+      get: (k: string) => (k === 'plugins.dir' ? pluginsDir : k === 'dataDir' ? tmpDir : undefined),
+    } as unknown as ConfigService;
+  });
+  afterEach(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
+
+  // The restore enables outside the per-plugin chain once it outlasts the boot wait. A disable answered
+  // "not enabled" would then be overtaken by the enable, and an uninstall would leave a worker running
+  // under no map entry, so both wait for the restore instead of racing it.
+  it('refuses enable, disable, update and uninstall of it, and leaves every other plugin alone', async () => {
+    const storage = new PluginStorageService(config);
+    const loader = new PluginLoaderService(config, new HookManager(), storage, {} as unknown as ModuleRef);
+    const service = new PluginsService(loader, config);
+    service.install({ buffer: pkg() });
+    service.install({ buffer: pkg({ id: 'other-plg' }) });
+    loader.setOperatorEnabled('svc-plg', true);
+    jest.spyOn(loader, 'isRestorePending').mockImplementation(id => id === 'svc-plg');
+
+    for (const attempt of [
+      () => service.enable('svc-plg'),
+      () => service.disable('svc-plg'),
+      () => service.updatePackage('svc-plg', pkg({ version: '2.0.0' })),
+      () => service.uninstall('svc-plg'),
+    ]) {
+      await expect(attempt()).rejects.toThrow(ConflictException);
+      await expect(attempt()).rejects.toThrow(/still being restored/);
+    }
+
+    // Nothing changed: the operator's decision stands and the plugin is still installed.
+    expect(storage.getPluginEntry('svc-plg')?.enabledByOperator).toBe(true);
+    expect(loader.getPlugin('svc-plg')?.manifest.version).toBe('1.0.0');
+    expect(fs.existsSync(path.join(pluginsDir, 'svc-plg'))).toBe(true);
+
+    await expect(service.disable('other-plg')).resolves.toMatchObject({ success: true });
+    await expect(service.uninstall('other-plg')).resolves.toMatchObject({ success: true });
+  });
+
+  it('takes the same changes again once the restore is done with it', async () => {
+    const loader = new PluginLoaderService(
+      config,
+      new HookManager(),
+      new PluginStorageService(config),
+      {} as unknown as ModuleRef,
+    );
+    const service = new PluginsService(loader, config);
+    service.install({ buffer: pkg() });
+    const pending = jest.spyOn(loader, 'isRestorePending').mockReturnValue(true);
+    await expect(service.uninstall('svc-plg')).rejects.toThrow(ConflictException);
+
+    pending.mockReturnValue(false);
+
+    await expect(service.uninstall('svc-plg')).resolves.toMatchObject({ success: true });
   });
 });
 
@@ -1060,6 +1205,21 @@ describe('PluginsService remote catalog', () => {
     fetchMock.mockImplementationOnce(() => Promise.resolve(Buffer.from(json)));
   };
 
+  it('keeps unknown extra fields and every optional field of the right type', async () => {
+    serveOnce(
+      '[{"id":"a","name":"A","version":"1.0.0","description":"d","keywords":["x"],"stars":5,"download":"https://x/a.zip"}]',
+    );
+    await expect(service().getCatalog()).resolves.toMatchObject([{ id: 'a', stars: 5, keywords: ['x'] }]);
+  });
+
+  it('accepts null in optional fields', async () => {
+    serveOnce('[{"id":"a","name":"A","version":"1.0.0","homepage":null,"keywords":null}]');
+    const [entry] = await service().getCatalog();
+    expect(entry).toMatchObject({ id: 'a', installed: false });
+    expect(entry).not.toHaveProperty('homepage');
+    expect(entry).not.toHaveProperty('keywords');
+  });
+
   it('annotates a well-formed catalog', async () => {
     serveOnce('[{"id":"a","name":"A","version":"1.0.0"}]');
     await expect(service().getCatalog()).resolves.toEqual([
@@ -1067,15 +1227,21 @@ describe('PluginsService remote catalog', () => {
     ]);
   });
 
-  it.each(['[null]', '[{"id":"a","name":"A","version":"1.0.0"},5]', '[[]]'])(
-    'answers 400, not 500, for a catalog with a non-object entry (%s)',
-    async json => {
-      serveOnce(json);
-      const err: unknown = await service()
-        .getCatalog()
-        .catch((e: unknown) => e);
-      expect(err).toBeInstanceOf(BadRequestException);
-      expect((err as BadRequestException).message).toMatch(/Invalid plugin catalog JSON/);
-    },
-  );
+  it.each([
+    '[null]',
+    '[{"id":"a","name":"A","version":"1.0.0"},5]',
+    '[[]]',
+    '[{"id":"a","name":{},"version":"1.0.0"}]',
+    '[{"id":"a","name":"A","version":"1.0.0","description":7}]',
+    '[{"id":"a","name":"A"}]',
+    '[{"id":"","name":"A","version":"1.0.0"}]',
+    '[{"id":"a","name":"A","version":"1.0.0","keywords":"x"}]',
+  ])('answers 400, not 500, for a catalog with a malformed entry (%s)', async json => {
+    serveOnce(json);
+    const err: unknown = await service()
+      .getCatalog()
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(BadRequestException);
+    expect((err as BadRequestException).message).toMatch(/Invalid plugin catalog JSON/);
+  });
 });

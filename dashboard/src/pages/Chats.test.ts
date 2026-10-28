@@ -11,7 +11,7 @@
 // JSX), loader hooks registered before any app-module import (see test-helpers/register-hooks),
 // and JSDOM installed before importing modules that read `window` at import time.
 import '../test-helpers/register-hooks.ts';
-import { test, before, afterEach } from 'node:test';
+import { test, before, afterEach, type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import { createElement } from 'react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
@@ -42,6 +42,9 @@ let twoSessions = false;
 // Its routes answer with the first session's fixtures, like session-2's.
 const SESSION_3: Session = { ...SESSION, id: 'session-3', name: 'Third', phone: '15550004444' };
 let thirdSessionStatus: Session['status'] | null = null;
+
+// When set, the session list answers this status with a gateway-style error body until a test clears it.
+let sessionListStatus: number | null = null;
 
 // Hits the global search answers with.
 let searchHits: SearchHit[] = [];
@@ -285,6 +288,7 @@ function installFetchStub(): void {
     fetchCalls.push({ method, path, body });
 
     if (method === 'GET' && path === '/api/sessions') {
+      if (sessionListStatus) return Promise.resolve(jsonResponse({ message: 'Bad Gateway' }, sessionListStatus));
       const listed = twoSessions ? [SESSION, SESSION_2] : [SESSION];
       if (thirdSessionStatus) listed.push({ ...SESSION_3, status: thirdSessionStatus });
       return Promise.resolve(jsonResponse(listed));
@@ -439,6 +443,7 @@ afterEach(async () => {
   olderPageFails = false;
   chatsResponder = null;
   thirdSessionStatus = null;
+  sessionListStatus = null;
   searchHits = [];
   engineType = 'baileys';
   channels = [CHANNEL];
@@ -1015,6 +1020,53 @@ test('a reconnect whose refetch fails while the engine starts sends no mark-as-r
   );
 });
 
+test('a reload asked for before the reconnect zeroed the open row does not bring the gap count back', async () => {
+  const { screen, fireEvent, within, act, waitFor } = rtl;
+  const { container } = renderChats();
+  await screen.findByText('Main (15551234567)');
+  fireEvent.click(await screen.findByText('Alice'));
+  await within(container.querySelector('.room-messages') as HTMLElement).findByText('hello from alice');
+  await new Promise(resolve => setTimeout(resolve, 1_000));
+  resetFetchCalls();
+
+  // Every snapshot counts Alice's gap messages, as the gateway does until it has processed the read.
+  const snapshot = [{ ...CHAT, unreadCount: 4, lastMessage: 'sent during the gap' }, CHAT_2];
+  const answers: Array<() => void> = [];
+  chatsResponder = () =>
+    new Promise<Response>(resolve => {
+      answers.push(() => resolve(jsonResponse(snapshot)));
+    });
+  const edit = () =>
+    receiveEvent('message.edited', {
+      messageId: 'wamid.carol.1',
+      chatId: CHAT_2.id,
+      body: 'edited',
+      timestamp: 1_700_003_000,
+    });
+  edit();
+  await waitFor(() => assert.equal(answers.length, 1));
+  const socket = lastSocket();
+  assert.ok(socket, 'expected the page to have opened a socket');
+  act(() => socket.receive('disconnect', 'transport close'));
+  act(() => socket.receive('connect'));
+  await flush();
+  answers[0]();
+  await screen.findByText('sent during the gap');
+  await waitFor(() => assert.equal(answers.length, 2), { timeout: 3_000 }); // the reconnect's own reload is out
+
+  // Another event asks for a list while it is out; that one starts the moment the reconnect's lands.
+  edit();
+  answers[1]();
+  // The row is zeroed with the reload, well before the read it sends is due.
+  await flush();
+  await flush();
+  assert.ok(!screen.queryByLabelText('4 unread messages'), 'the open chat was badged');
+  await waitFor(() => assert.equal(answers.length, 3), { timeout: 3_000 });
+  answers[2]();
+  await new Promise(resolve => setTimeout(resolve, 300));
+  assert.ok(!screen.queryByLabelText('4 unread messages'), 'the gap count came back on the open chat');
+});
+
 test('a reconnect refetch that settles after the open chat was left keeps its unread count', async () => {
   const { screen, fireEvent, within, act, waitFor } = rtl;
   const { container } = renderChats();
@@ -1115,7 +1167,7 @@ test('logging out sends no pending mark-as-read without a key', async () => {
   assert.equal(await leaveWithPendingRead(true), 0, 'a keyless mark-as-read went out after logout');
 });
 
-test('a reconnect refetch overtaken by a newer list still marks the open chat read', async () => {
+test('a reconnect that arrives while another reload is out is answered by the trailing one, which marks the open chat read', async () => {
   const { screen, fireEvent, within, act, waitFor } = rtl;
   const { container } = renderChats();
   await screen.findByText('Main (15551234567)');
@@ -1124,48 +1176,41 @@ test('a reconnect refetch overtaken by a newer list still marks the open chat re
   await new Promise(resolve => setTimeout(resolve, 1_000));
   resetFetchCalls();
 
-  // The reconnect refetch stays out while a live frame for an unlisted chat fires a second one, which
-  // lands first. Both snapshots count Alice's gap messages, although her chat is open.
-  const DAVE: Chat = { ...CHAT_2, id: '15550005555@c.us', name: 'Dave', timestamp: 1_700_000_900 };
-  const snapshot = [{ ...CHAT, unreadCount: 4, lastMessage: 'sent during the gap' }, CHAT_2, DAVE];
-  let releaseFirst!: () => void;
-  const firstGate = new Promise<void>(resolve => {
-    releaseFirst = resolve;
-  });
-  let served = 0;
+  // An edit in a chat that was never opened reloads the list, and that reload stays out while the socket
+  // drops and reconnects, so the reconnect's own reload waits behind it. Both snapshots count Alice's gap
+  // messages, although her chat is open.
+  const snapshot = [{ ...CHAT, unreadCount: 4, lastMessage: 'sent during the gap' }, CHAT_2];
+  const answers: Array<() => void> = [];
   chatsResponder = () =>
-    ++served === 1 ? firstGate.then(() => jsonResponse(snapshot)) : Promise.resolve(jsonResponse(snapshot));
+    new Promise<Response>(resolve => {
+      answers.push(() => resolve(jsonResponse(snapshot)));
+    });
+  receiveEvent('message.edited', {
+    messageId: 'wamid.carol.1',
+    chatId: CHAT_2.id,
+    body: 'edited',
+    timestamp: 1_700_003_000,
+  });
+  await waitFor(() => assert.equal(answers.length, 1));
   const socket = lastSocket();
   assert.ok(socket, 'expected the page to have opened a socket');
   act(() => socket.receive('disconnect', 'transport close'));
   act(() => socket.receive('connect'));
-  await waitFor(() => assert.equal(countFetchCalls('GET', `/api/sessions/${SESSION.id}/chats?limit=1000&offset=0`), 1));
+  await flush();
+  assert.equal(answers.length, 1, 'the reconnect started a reload of its own while one was out');
 
-  act(() =>
-    socket.receive('message', {
-      type: 'event',
-      timestamp: new Date(1_700_002_000_000).toISOString(),
-      payload: {
-        event: 'message.received',
-        sessionId: SESSION.id,
-        data: {
-          id: 'wamid.live.dave',
-          chatId: DAVE.id,
-          from: DAVE.id,
-          to: 'me',
-          body: 'dave says hi',
-          type: 'text',
-          fromMe: false,
-          timestamp: 1_700_001_900,
-        },
-      },
-    }),
-  );
+  // The reload that was already out lands first. It began before the reconnect, so it is not the
+  // reconnect's answer and the open chat keeps the gap count for now.
+  answers[0]();
   await screen.findByText('sent during the gap');
+  assert.ok(screen.queryByLabelText('4 unread messages'), 'a reload that began before the reconnect answered it');
+  await waitFor(() => assert.equal(answers.length, 2));
 
-  releaseFirst();
+  answers[1]();
+  await waitFor(() =>
+    assert.ok(!screen.queryByLabelText('4 unread messages'), 'the open chat was badged with the gap count'),
+  );
   await new Promise(resolve => setTimeout(resolve, 1_000));
-  assert.ok(!screen.queryByLabelText('4 unread messages'), 'the open chat was badged with the gap count');
   assert.ok(
     fetchCalls.some(
       c =>
@@ -1255,9 +1300,10 @@ test('switching session with a chat open marks only the chats opened on the new 
     unmount();
     await flush();
     await flush();
-    assert.deepEqual(readsOnTwo, [{ chatId: CHAT_2.id }]);
+    const chatIdsOf = (reads: unknown[]) => reads.map(read => (read as { chatId: string }).chatId);
+    assert.deepEqual(chatIdsOf(readsOnTwo), [CHAT_2.id]);
     // The read queued for the session that was left still reaches that session.
-    assert.deepEqual(readsOnOne, [{ chatId: CHAT.id }]);
+    assert.deepEqual(chatIdsOf(readsOnOne), [CHAT.id]);
   } finally {
     globalThis.fetch = stub;
     twoSessions = false;
@@ -1809,48 +1855,222 @@ test("a failed background refetch during a session switch keeps the spinner over
   }
 });
 
-test('a chat list refetch lands while a newer one is out, and an older answer never overwrites a newer', async () => {
-  const { screen, waitFor } = rtl;
-  const { container } = renderChats();
-  await screen.findByText('Alice');
-
-  // Edits to a chat that was never opened refetch the list each, and they arrive faster than it answers.
+// Answers every chat list request by hand, in the order asked. Each answer is a list led by Carol, whose
+// preview names the request it answers, so a test sees which one the sidebar shows.
+function holdChatLists(): Array<() => void> {
   const answers: Array<() => void> = [];
   chatsResponder = () =>
     new Promise<Response>(resolve => {
       const version = answers.length + 1;
       answers.push(() => resolve(jsonResponse([{ ...CHAT_2, lastMessage: `carol v${version}` }, CHAT])));
     });
-  const socket = lastSocket();
-  assert.ok(socket, 'expected the page to have opened a socket');
-  const edit = (messageId: string): void =>
-    socket.receive('message', {
-      type: 'event',
-      timestamp: new Date(1_700_003_000_000).toISOString(),
-      payload: {
-        event: 'message.edited',
-        sessionId: SESSION.id,
-        data: { messageId, chatId: CHAT_2.id, body: 'edited', timestamp: 1_700_003_000 },
-      },
-    });
-  edit('wamid.carol.1');
-  edit('wamid.carol.2');
-  edit('wamid.carol.3');
-  await waitFor(() => assert.equal(answers.length, 3));
-  assert.ok(screen.queryByText('Alice'), 'a background refetch hid the chat list behind the loading spinner');
+  return answers;
+}
 
-  // The first answer is the newest one applied so far, so it lands although newer calls are still out.
+// Two edits and a deletion in a chat that was never opened, and a message from a chat the sidebar does not
+// list: four events that each ask for a list reload.
+function askForReloads(): void {
+  const DAVE = '15550009999@c.us';
+  for (const messageId of ['wamid.carol.1', 'wamid.carol.2']) {
+    receiveEvent('message.edited', { messageId, chatId: CHAT_2.id, body: 'edited', timestamp: 1_700_003_000 });
+  }
+  receiveEvent('message.revoked', {
+    id: 'wamid.carol.3',
+    revokedId: 'wamid.carol.3',
+    chatId: CHAT_2.id,
+    from: CHAT_2.id,
+    to: 'me',
+    body: '',
+    type: 'revoked',
+    timestamp: 1_700_003_000,
+  });
+  receiveEvent('message.received', {
+    id: 'wamid.dave.1',
+    chatId: DAVE,
+    from: DAVE,
+    to: 'me',
+    body: 'hi',
+    type: 'text',
+    fromMe: false,
+    timestamp: 1_700_003_000,
+  });
+}
+
+test('background reloads asked for while one is out share a single trailing reload', async () => {
+  const { screen, waitFor } = rtl;
+  renderChats();
+  await screen.findByText('Alice');
+  resetFetchCalls();
+  const chatsPath = `/api/sessions/${SESSION.id}/chats?limit=1000&offset=0`;
+  const answers = holdChatLists();
+
+  askForReloads();
+  await waitFor(() => assert.equal(answers.length, 1));
+  await flush();
+  await flush();
+  assert.equal(countFetchCalls('GET', chatsPath), 1, 'a trigger made while a reload was out started its own');
+  assert.ok(screen.queryByText('Alice'), 'a background reload hid the chat list behind the loading spinner');
+
+  // The reload that was out lands, and the three triggers it left waiting are answered by ONE more.
   answers[0]();
   await screen.findByText('carol v1');
-  assert.equal(container.querySelector('.chats-list-loading') === null, true, 'the list stayed on the loading spinner');
+  await waitFor(() => assert.equal(answers.length, 2));
+  answers[1]();
+  await screen.findByText('carol v2');
+  await flush();
+  await flush();
+  assert.equal(countFetchCalls('GET', chatsPath), 2, 'the waiting triggers did not share one reload');
+});
 
+test('triggers made while the trailing reload is out queue one more behind it', async () => {
+  const { screen, waitFor } = rtl;
+  renderChats();
+  await screen.findByText('Alice');
+  resetFetchCalls();
+  const chatsPath = `/api/sessions/${SESSION.id}/chats?limit=1000&offset=0`;
+  const answers = holdChatLists();
+
+  askForReloads();
+  await waitFor(() => assert.equal(answers.length, 1));
+  answers[0]();
+  await waitFor(() => assert.equal(answers.length, 2));
+
+  // The trailing reload is the one out now, so these four wait for one more reload, not four.
+  askForReloads();
+  await flush();
+  await flush();
+  assert.equal(countFetchCalls('GET', chatsPath), 2);
+  answers[1]();
+  await waitFor(() => assert.equal(answers.length, 3));
   answers[2]();
   await screen.findByText('carol v3');
+  await flush();
+  await flush();
+  assert.equal(countFetchCalls('GET', chatsPath), 3);
+});
+
+// A background walk that never answers is cut at a deadline of the page's own, a timer of a couple of minutes.
+// Only a timer that long is held back, to be fired by hand, so the rest of the page keeps its real clock.
+function holdWalkDeadlines(t: TestContext): Array<() => void> {
+  const fire: Array<() => void> = [];
+  const realSetTimeout = globalThis.setTimeout;
+  t.mock.method(globalThis, 'setTimeout', ((callback: () => void, ms?: number, ...args: unknown[]) => {
+    // Above a healthy walk, and below the 180 s the gateway takes to answer a stalled engine.
+    if (typeof ms === 'number' && ms >= 60_000 && ms < 180_000) {
+      fire.push(callback);
+      return { unref: () => undefined } as unknown as ReturnType<typeof setTimeout>;
+    }
+    return realSetTimeout(callback, ms, ...args);
+  }) as typeof setTimeout);
+  return fire;
+}
+
+test('a background walk that never answers is abandoned at its deadline, and the reload behind it starts', async t => {
+  const { screen, waitFor } = rtl;
+  renderChats();
+  await screen.findByText('Alice');
+  const deadlines = holdWalkDeadlines(t);
+  // Every list request stays out until its signal aborts it, as a half-open connection would.
+  const signals: Array<AbortSignal | null | undefined> = [];
+  chatsResponder = (_sessionId, _offset, signal) =>
+    new Promise<Response>((_resolve, reject) => {
+      signals.push(signal);
+      signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')), { once: true });
+    });
+
+  askForReloads();
+  await waitFor(() => assert.equal(signals.length, 1));
+  assert.equal(deadlines.length, 1, 'the background walk was given no deadline');
+  await flush();
+  assert.equal(signals.length, 1, 'a trigger made while the walk was out started its own');
+
+  deadlines[0]();
+  await waitFor(() => assert.equal(signals.length, 2, 'the reload behind the stalled walk never started'));
+  assert.equal(signals[0]?.aborted, true, 'the stalled walk was left holding its request');
+  assert.equal(signals[1]?.aborted, false);
+});
+
+test('a background reload that lands before the initial list is not overwritten by it', async () => {
+  const { screen, waitFor } = rtl;
+  const answers = holdChatLists();
+  const { container } = renderChats();
+  await screen.findByText('Main (15551234567)');
+  await waitFor(() => assert.equal(answers.length, 1));
+  assert.ok(container.querySelector('.chats-list-loading'), 'the initial list showed no spinner');
+
+  // The reload is a different kind of load from the one under the spinner, so it starts at once instead of
+  // waiting behind it, and whichever began later wins however the two land.
+  receiveEvent('message.edited', {
+    messageId: 'wamid.carol.1',
+    chatId: CHAT_2.id,
+    body: 'edited',
+    timestamp: 1_700_003_000,
+  });
+  await waitFor(() => assert.equal(answers.length, 2));
+
   answers[1]();
   await flush();
   await flush();
-  assert.ok(screen.queryByText('carol v3'), 'an older answer replaced the newer list');
-  assert.ok(!screen.queryByText('carol v2'), 'an older answer replaced the newer list');
+  assert.ok(container.querySelector('.chats-list-loading'), 'a background reload cleared the initial list spinner');
+
+  answers[0]();
+  await screen.findByText('carol v2');
+  assert.ok(!screen.queryByText('carol v1'), 'the older initial answer replaced the newer list');
+  assert.equal(container.querySelector('.chats-list-loading') === null, true, 'the list stayed on the loading spinner');
+});
+
+test("a session switch drops the previous session's trailing reload and lets the new session reload at once", async () => {
+  const { screen, fireEvent, waitFor } = rtl;
+  twoSessions = true;
+  const asked = { one: 0, two: 0 };
+  const held: Array<() => void> = [];
+  let holdOne = false;
+  chatsResponder = sessionId => {
+    if (sessionId === SESSION_2.id) {
+      asked.two += 1;
+      return Promise.resolve(jsonResponse([{ ...CHAT_2, lastMessage: 'carol on two' }]));
+    }
+    asked.one += 1;
+    if (!holdOne) return Promise.resolve(jsonResponse([CHAT, CHAT_2]));
+    return new Promise<Response>(resolve => {
+      held.push(() => resolve(jsonResponse([{ ...CHAT, lastMessage: 'alice on one' }, CHAT_2])));
+    });
+  };
+  try {
+    const { container } = renderChats();
+    await screen.findByText('Alice');
+    holdOne = true;
+
+    // One reload is out for session 1 and a second trigger waits behind it.
+    for (const messageId of ['wamid.carol.1', 'wamid.carol.2']) {
+      receiveEvent('message.edited', { messageId, chatId: CHAT_2.id, body: 'edited', timestamp: 1_700_003_000 });
+    }
+    await waitFor(() => assert.equal(held.length, 1));
+    assert.equal(asked.one, 2);
+
+    fireEvent.change(container.querySelector('select.session-selector') as HTMLSelectElement, {
+      target: { value: SESSION_2.id },
+    });
+    await screen.findByText('carol on two');
+
+    // Session 2 is not queued behind the reload session 1 left out.
+    receiveEvent(
+      'message.edited',
+      { messageId: 'wamid.carol.9', chatId: CHAT_2.id, body: 'edited', timestamp: 1 },
+      SESSION_2.id,
+    );
+    await waitFor(() => assert.equal(asked.two, 2));
+
+    held[0]();
+    await flush();
+    await flush();
+    await new Promise(resolve => setTimeout(resolve, 100));
+    assert.equal(asked.one, 2, 'the trailing reload of the session left behind started after the switch');
+    assert.ok(screen.queryByText('carol on two'), "the previous session's reload replaced the new session's list");
+    assert.ok(!screen.queryByText('alice on one'), "the previous session's list showed under the new session");
+  } finally {
+    twoSessions = false;
+  }
 });
 
 test('a failed background refetch keeps the chat list and raises no error', async () => {
@@ -2027,6 +2247,28 @@ async function clickSearchHit(container: HTMLElement): Promise<void> {
   });
   fireEvent.click(hit);
 }
+
+test('a search hit in another session closes the new chat panel of the session that was left', async () => {
+  const { screen, fireEvent, waitFor } = rtl;
+  twoSessions = true;
+  searchHits = [{ ...THIRD_SESSION_HIT, sessionId: SESSION_2.id }];
+  try {
+    const { container } = renderChats();
+    await screen.findByText('Alice');
+    // The panel replaces the sidebar lists, session selector included, so a hit is the way to another session.
+    fireEvent.click(screen.getByRole('button', { name: 'New chat' }));
+    assert.ok(container.querySelector('.new-chat-panel'), 'the panel did not open');
+
+    await clickSearchHit(container);
+    await waitFor(() =>
+      assert.ok(!container.querySelector('.new-chat-panel'), 'the panel stayed open on the other session'),
+    );
+    const select = container.querySelector('select.session-selector') as HTMLSelectElement;
+    assert.equal(select.value, SESSION_2.id);
+  } finally {
+    twoSessions = false;
+  }
+});
 
 test('a search hit in a session that is not connected stays on the selected session', async () => {
   const { screen, waitFor } = rtl;
@@ -2813,15 +3055,78 @@ test('a message sent while the first page is still loading survives the page lan
   await waitFor(() => assert.equal(within(thread).queryAllByText('sent while loading').length, 1));
 });
 
-function receiveEvent(event: string, data: Record<string, unknown>): void {
+function receiveEvent(event: string, data: Record<string, unknown>, sessionId: string = SESSION.id): void {
   const socket = lastSocket();
   assert.ok(socket, 'expected the page to have opened a socket');
   socket.receive('message', {
     type: 'event',
     timestamp: new Date(1_700_003_000_000).toISOString(),
-    payload: { event, sessionId: SESSION.id, data },
+    payload: { event, sessionId, data },
   });
 }
+
+test('a live edit labels the message it changed, and not one whose text it repeats', async () => {
+  const { screen, fireEvent, within, waitFor } = rtl;
+  const { container } = renderChats();
+  fireEvent.click(await screen.findByText('Alice'));
+  const room = container.querySelector('.room-messages') as HTMLElement;
+  await within(room).findByText('hello from alice');
+  const labels = () => room.querySelectorAll('.message-edited').length;
+  assert.equal(labels(), 0);
+
+  // The backend announces an edit that repeats the stored text but no longer stores a marker for it.
+  receiveEvent('message.edited', {
+    messageId: DB_MESSAGE.waMessageId,
+    chatId: CHAT.id,
+    body: DB_MESSAGE.body,
+    timestamp: 1_700_003_001,
+  });
+  await flush();
+  assert.equal(labels(), 0, 'a repeated text was labelled as edited');
+
+  receiveEvent('message.edited', {
+    messageId: DB_MESSAGE.waMessageId,
+    chatId: CHAT.id,
+    body: 'hello from alice, edited',
+    timestamp: 1_700_003_002,
+  });
+  await waitFor(() => assert.equal(labels(), 1, 'a changed text was not labelled as edited'));
+  await within(room).findByText('hello from alice, edited');
+});
+
+// The gateway announces the edit of a message it had not stored yet before the message, which then arrives with
+// the edited text and, where its row is marked, the mark.
+test('a live message announced as edited is labelled, though its edit arrived first', async () => {
+  const { screen, fireEvent, within, waitFor } = rtl;
+  const { container } = renderChats();
+  fireEvent.click(await screen.findByText('Alice'));
+  const room = container.querySelector('.room-messages') as HTMLElement;
+  await within(room).findByText('hello from alice');
+  const labelOf = (text: string) =>
+    within(room).getByText(text).closest('.message-bubble')?.querySelector('.message-edited');
+  const arrive = (id: string, body: string, edited?: true) => {
+    receiveEvent('message.edited', { messageId: id, chatId: CHAT.id, body, timestamp: 1_700_003_001 });
+    receiveEvent('message.received', {
+      id,
+      chatId: CHAT.id,
+      from: CHAT.id,
+      to: 'me',
+      body,
+      type: 'text',
+      fromMe: false,
+      timestamp: 1_700_003_000,
+      ...(edited ? { edited } : {}),
+    });
+  };
+
+  arrive('wamid.live.edited', 'corrected on arrival', true);
+  arrive('wamid.live.same', 'sent as it was');
+  await within(room).findByText('corrected on arrival');
+  await within(room).findByText('sent as it was');
+
+  await waitFor(() => assert.ok(labelOf('corrected on arrival'), 'the message announced as edited was not labelled'));
+  assert.equal(labelOf('sent as it was') ?? null, null, 'a message announced without the mark was labelled');
+});
 
 test('an edit arriving after the newest message was deleted for everyone does not refill the sidebar preview', async () => {
   const { screen, fireEvent, within, waitFor } = rtl;
@@ -2949,4 +3254,421 @@ test('a live sidebar row survives movement outside a paginated reconnect snapsho
   await rtl.screen.findByText('Tail conversation');
   assert.equal(rtl.screen.getAllByText('Updated during paging').length, 1);
   assert.ok(rtl.screen.queryByLabelText('3 unread messages'));
+});
+
+// ── Reading position of a thread ─────────────────────────────────────────────
+
+const ROOM_HEIGHT = 600;
+/** What a reaction badge adds to the thread. */
+const BADGE_PX = 20;
+
+/**
+ * Scroll geometry for every `.room-messages` the page mounts, clamped to the content as a browser clamps it. The
+ * room unmounts when a session switch closes its chat, so a shim on one element (makeScrollable) would arrive
+ * after the restore it is meant to see. Content height is the bubbles, as in makeScrollable.
+ */
+function installRoomGeometry(bubblePx: number = BUBBLE_PX): () => void {
+  const proto = window.HTMLDivElement.prototype;
+  const inherited = Object.getOwnPropertyDescriptors(window.Element.prototype);
+  const tops = new WeakMap<Element, number>();
+  const isRoom = (el: Element): boolean => el.classList.contains('room-messages');
+  const contentHeight = (el: Element): number =>
+    el.querySelectorAll('.message-bubble').length * bubblePx +
+    el.querySelectorAll('.message-reactions-badge').length * BADGE_PX;
+  const maxTop = (el: Element): number => Math.max(0, contentHeight(el) - ROOM_HEIGHT);
+  Object.defineProperties(proto, {
+    scrollHeight: {
+      configurable: true,
+      get(this: Element) {
+        return isRoom(this) ? contentHeight(this) : inherited.scrollHeight.get!.call(this);
+      },
+    },
+    clientHeight: {
+      configurable: true,
+      get(this: Element) {
+        return isRoom(this) ? ROOM_HEIGHT : inherited.clientHeight.get!.call(this);
+      },
+    },
+    scrollTop: {
+      configurable: true,
+      get(this: Element) {
+        return isRoom(this) ? Math.min(tops.get(this) ?? 0, maxTop(this)) : inherited.scrollTop.get!.call(this);
+      },
+      set(this: Element, value: number) {
+        if (isRoom(this)) tops.set(this, Math.max(0, Math.min(value, maxTop(this))));
+        else inherited.scrollTop.set!.call(this, value);
+      },
+    },
+  });
+  return () => {
+    for (const key of ['scrollHeight', 'clientHeight', 'scrollTop'] as const) {
+      delete (proto as unknown as Record<string, unknown>)[key];
+    }
+  };
+}
+
+test('a chat opened in another session starts at its newest message, not at the offset left in the first', async () => {
+  const { screen, fireEvent, within } = rtl;
+  twoSessions = true;
+  // Session 2 lists Carol too, a contact both accounts share.
+  chatsResponder = sessionId =>
+    Promise.resolve(
+      jsonResponse(sessionId === SESSION.id ? [CHAT, CHAT_2] : [CHAT, { ...CHAT_2, lastMessage: 'carol on two' }]),
+    );
+  const restoreGeometry = installRoomGeometry();
+  try {
+    const { container } = renderChats();
+    const thread = await openPagedChat(container);
+    assert.equal(thread.scrollTop, thread.scrollHeight - thread.clientHeight, 'a first visit did not open at the end');
+
+    thread.scrollTop = 900; // the reader goes back through Carol's history in the first session
+    fireEvent.scroll(thread);
+
+    const selector = container.querySelector('select.session-selector') as HTMLSelectElement;
+    fireEvent.change(selector, { target: { value: SESSION_2.id } });
+    await screen.findByText('carol on two');
+    fireEvent.click(screen.getByText('Carol'));
+    const second = container.querySelector('.room-messages') as HTMLElement;
+    await within(second).findByText('paged message 119');
+    assert.equal(
+      second.scrollTop,
+      second.scrollHeight - second.clientHeight,
+      "Carol opened in the second session at the offset left in the first session's thread",
+    );
+
+    // The first session's own position is still there when the reader comes back to it.
+    fireEvent.change(selector, { target: { value: SESSION.id } });
+    await screen.findByText('hello from carol');
+    fireEvent.click(screen.getByText('Carol'));
+    const back = container.querySelector('.room-messages') as HTMLElement;
+    await within(back).findByText('paged message 119');
+    assert.equal(back.scrollTop, 900, "the first session's position was lost");
+  } finally {
+    restoreGeometry();
+    twoSessions = false;
+  }
+});
+
+// A live message in the open chat follows a reader who is at the bottom, whoever sent it: the contact, or the
+// account itself (the phone, an API client, an automation).
+for (const fromMe of [false, true]) {
+  test(`a live message ${fromMe ? 'from the account itself' : 'from the contact'} scrolls a reader at the bottom to it`, async () => {
+    const { within, waitFor } = rtl;
+    const restoreGeometry = installRoomGeometry();
+    try {
+      const { container } = renderChats();
+      const thread = await openPagedChat(container);
+      const newest = (): number => thread.scrollHeight - thread.clientHeight;
+      assert.equal(thread.scrollTop, newest(), 'a first visit did not open at the end');
+
+      receiveEvent(fromMe ? 'message.sent' : 'message.received', {
+        id: 'wamid.live.follow',
+        chatId: CHAT_2.id,
+        from: fromMe ? 'me' : CHAT_2.id,
+        to: fromMe ? CHAT_2.id : 'me',
+        body: 'live follow',
+        type: 'text',
+        fromMe,
+        timestamp: 1_700_001_500,
+      });
+      await within(thread).findByText('live follow');
+      await waitFor(() => assert.equal(thread.scrollTop, newest(), 'the new message was left below the fold'));
+    } finally {
+      restoreGeometry();
+    }
+  });
+}
+
+test('a live message from the account itself leaves a reader of older messages where they are', async () => {
+  const { fireEvent, within } = rtl;
+  const restoreGeometry = installRoomGeometry();
+  try {
+    const { container } = renderChats();
+    const thread = await openPagedChat(container);
+    thread.scrollTop = 900;
+    fireEvent.scroll(thread);
+
+    receiveEvent('message.sent', {
+      id: 'wamid.live.reading',
+      chatId: CHAT_2.id,
+      from: 'me',
+      to: CHAT_2.id,
+      body: 'live while reading',
+      type: 'text',
+      fromMe: true,
+      timestamp: 1_700_001_500,
+    });
+    await within(thread).findByText('live while reading');
+    await flush();
+    assert.equal(thread.scrollTop, 900);
+  } finally {
+    restoreGeometry();
+  }
+});
+
+test('a message sent from the page scrolls the thread to it, whatever the reader was reading', async () => {
+  const { screen, fireEvent, within, waitFor } = rtl;
+  const restoreGeometry = installRoomGeometry();
+  try {
+    const { container } = renderChats();
+    const thread = await openPagedChat(container);
+    thread.scrollTop = 900;
+    fireEvent.scroll(thread);
+
+    fireEvent.change(screen.getByPlaceholderText('Type a message...'), { target: { value: 'sent from the page' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }));
+    await within(thread).findByText('sent from the page');
+    await waitFor(() =>
+      assert.equal(
+        thread.scrollTop,
+        thread.scrollHeight - thread.clientHeight,
+        'the thread stayed where the reader was',
+      ),
+    );
+  } finally {
+    restoreGeometry();
+  }
+});
+
+// A message that merges into a row the thread already holds adds no row, so it must not leave the thread waiting for
+// one: the next commit that grows it would be taken for that row.
+test('the echo of a send from the page, after its response, does not take a reader paging upward to the bottom', async () => {
+  const { screen, fireEvent, within, waitFor } = rtl;
+  resetFetchCalls();
+  // Bubbles are 8px, so the older page is about as tall as the thread's whole scroll range, as a page of 100 rows is.
+  const bubblePx = 8;
+  const restoreGeometry = installRoomGeometry(bubblePx);
+  try {
+    const { container } = renderChats();
+    const thread = await openPagedChat(container);
+
+    fireEvent.change(screen.getByPlaceholderText('Type a message...'), { target: { value: 'reply from the page' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }));
+    await within(thread).findByText('reply from the page');
+    await waitFor(() => assert.ok(findFetchCall('POST', `/api/sessions/${SESSION.id}/messages/send-text`)));
+    await flush(); // the response has reconciled the placeholder under its real id
+    receiveEvent('message.sent', {
+      id: sendTextId,
+      chatId: CHAT_2.id,
+      from: 'me',
+      to: CHAT_2.id,
+      body: 'reply from the page',
+      type: 'text',
+      fromMe: true,
+      timestamp: 1_700_001_500,
+    });
+    await flush();
+    assert.equal(within(thread).getAllByText('reply from the page').length, 1, 'the echo added a second row');
+
+    // The reader goes back through the history; the older page lands above them.
+    const releaseOlderPage = holdOlderPage();
+    thread.scrollTop = 0;
+    fireEvent.scroll(thread);
+    await waitFor(() => assert.ok(thread.querySelector('.messages-loading-older')));
+    releaseOlderPage();
+    await within(thread).findByText('paged message 0');
+    await waitFor(() => assert.equal(thread.querySelector('.messages-loading-older') === null, true));
+    assert.equal(
+      thread.scrollTop,
+      PAGED_OLDEST.length * bubblePx,
+      'the reader was not held on the message they were on',
+    );
+  } finally {
+    restoreGeometry();
+  }
+});
+
+test('a message delivered twice leaves a reader just above the bottom where they are when the thread grows', async () => {
+  const { fireEvent, within, waitFor } = rtl;
+  const restoreGeometry = installRoomGeometry();
+  try {
+    const { container } = renderChats();
+    const thread = await openPagedChat(container);
+    thread.scrollTop = thread.scrollHeight - thread.clientHeight - 60; // inside the 100px band that follows
+    fireEvent.scroll(thread);
+    const reader = thread.scrollTop;
+
+    // The newest row arrives again: the cache merges it, and the thread does not grow.
+    receiveEvent('message.received', {
+      id: 'wamid.paged.119',
+      chatId: CHAT_2.id,
+      from: CHAT_2.id,
+      to: 'me',
+      body: 'paged message 119',
+      type: 'text',
+      fromMe: false,
+      timestamp: 1_700_001_119,
+    });
+    await flush();
+    assert.equal(thread.querySelectorAll('.message-bubble').length, PAGE_SIZE, 'the duplicate added a row');
+
+    // Something else grows the thread: a reaction badge under a bubble.
+    receiveEvent('message.reaction', {
+      messageId: 'wamid.paged.119',
+      chatId: CHAT_2.id,
+      reaction: '👍',
+      senderId: CHAT_2.id,
+      reactions: { [CHAT_2.id]: '👍' },
+    });
+    await waitFor(() => assert.ok(thread.querySelector('.message-reactions-badge')));
+    await within(thread).findByText('paged message 119');
+    assert.equal(thread.scrollTop, reader, 'the reader was taken to the bottom by a commit that was not a new message');
+  } finally {
+    restoreGeometry();
+  }
+});
+
+test('a message sent from the page scrolls a chat reopened at its saved spot to it', async () => {
+  const { screen, fireEvent, within, waitFor } = rtl;
+  const restoreGeometry = installRoomGeometry();
+  try {
+    const { container } = renderChats();
+    const thread = await openPagedChat(container);
+    thread.scrollTop = 900; // the reader's spot in Carol's thread
+    fireEvent.scroll(thread);
+
+    fireEvent.click(await screen.findByText('Alice'));
+    await within(container.querySelector('.room-header') as HTMLElement).findByText('Alice');
+    fireEvent.click(await screen.findByText('Carol'));
+    await within(container.querySelector('.room-messages') as HTMLElement).findByText('paged message 119');
+    assert.equal(thread.scrollTop, 900, 'Carol did not reopen at the spot the reader left');
+
+    fireEvent.change(screen.getByPlaceholderText('Type a message...'), { target: { value: 'sent at the saved spot' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }));
+    await within(thread).findByText('sent at the saved spot');
+    await waitFor(() =>
+      assert.equal(
+        thread.scrollTop,
+        thread.scrollHeight - thread.clientHeight,
+        'the sent message was left below the fold',
+      ),
+    );
+  } finally {
+    restoreGeometry();
+  }
+});
+
+test('a message sent while a chat with a saved spot loads again opens the chat at it', async () => {
+  const { screen, fireEvent, within, waitFor } = rtl;
+  resetFetchCalls();
+  // Forty more of Alice's messages, so her thread scrolls.
+  firstPageExtra = Array.from({ length: 40 }, (_, i) => ({
+    ...DB_MESSAGE,
+    id: `db-extra-${i}`,
+    waMessageId: `wamid.extra.${i}`,
+    body: `alice extra ${i}`,
+    timestamp: 1_700_000_100 + i,
+    createdAt: new Date((1_700_000_100 + i) * 1000).toISOString(),
+  }));
+  const restoreGeometry = installRoomGeometry();
+  try {
+    const { container } = renderChats();
+    await screen.findByText('Main (15551234567)');
+    fireEvent.click(await screen.findByText('Alice'));
+    const thread = container.querySelector('.room-messages') as HTMLElement;
+    await within(thread).findByText('alice extra 39');
+    thread.scrollTop = 300; // the reader's spot in Alice's thread
+    fireEvent.scroll(thread);
+
+    fireEvent.click(await screen.findByText('Carol'));
+    await within(thread).findByText('paged message 119');
+    // Alice's thread leaves the cache while the reader is elsewhere, and her first page is slow to come back.
+    queryClient!.removeQueries({ queryKey: ['messages', SESSION.id, CHAT.id] });
+    let releaseFirstPage!: () => void;
+    firstPageGate = new Promise<void>(resolve => {
+      releaseFirstPage = resolve;
+    });
+    fireEvent.click(await screen.findByText('Alice'));
+    await waitFor(() => assert.ok(thread.querySelector('.messages-loading')));
+
+    fireEvent.change(screen.getByPlaceholderText('Type a message...'), { target: { value: 'sent while loading' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }));
+    await waitFor(() => assert.ok(findFetchCall('POST', `/api/sessions/${SESSION.id}/messages/send-text`)));
+    await flush();
+    releaseFirstPage();
+    await within(thread).findByText('sent while loading');
+    assert.equal(
+      thread.scrollTop,
+      thread.scrollHeight - thread.clientHeight,
+      'the message sent while the chat loaded was left below the fold',
+    );
+  } finally {
+    restoreGeometry();
+  }
+});
+
+// ── Live feed subscription ───────────────────────────────────────────────────
+
+const MESSAGE_FEED_EVENTS = [
+  'message.received',
+  'message.sent',
+  'message.ack',
+  'message.reaction',
+  'message.revoked',
+  'message.edited',
+  'status.received',
+];
+
+/** The payload of every frame the page sent over the socket. */
+const feedFrames = (): unknown[] => (lastSocket()?.emitted ?? []).map(frame => frame.args[0]);
+
+test("the page joins the open session's message events once connected, and moves to the next session on a switch", async () => {
+  const { screen, fireEvent, waitFor } = rtl;
+  twoSessions = true;
+  try {
+    const { container } = renderChats();
+    await screen.findByText('Main (15551234567)');
+    await waitFor(() =>
+      assert.deepEqual(feedFrames(), [{ type: 'subscribe', sessionId: SESSION.id, events: MESSAGE_FEED_EVENTS }]),
+    );
+
+    fireEvent.change(container.querySelector('select.session-selector') as HTMLSelectElement, {
+      target: { value: SESSION_2.id },
+    });
+    await waitFor(() =>
+      assert.deepEqual(feedFrames().slice(1), [
+        { type: 'unsubscribe', sessionId: SESSION.id },
+        { type: 'subscribe', sessionId: SESSION_2.id, events: MESSAGE_FEED_EVENTS },
+      ]),
+    );
+  } finally {
+    twoSessions = false;
+  }
+});
+
+// A failed read of the sessions is not "no connected sessions", which tells the operator to go connect one.
+test('a failed session list says so and offers the read again, not the no-sessions guidance', async () => {
+  const { screen, fireEvent, within } = rtl;
+  sessionListStatus = 502;
+  renderChats();
+
+  const alert = await screen.findByRole('alert');
+  assert.match(alert.textContent ?? '', /Failed to load sessions/);
+  assert.match(alert.textContent ?? '', /Bad Gateway/);
+  assert.equal(
+    screen.queryByText('No connected sessions') === null,
+    true,
+    'a failed read claimed there are no sessions',
+  );
+
+  sessionListStatus = null;
+  fireEvent.click(within(alert).getByRole('button', { name: 'Retry' }));
+  await screen.findByText('Alice');
+  assert.equal(screen.queryByRole('alert') === null, true);
+});
+
+// A chat list that could not be read is not an empty one: the sidebar alone would read "No chats".
+test('a failed chat list says so and offers the read again, then clears once a read lands', async () => {
+  const { screen, fireEvent, within } = rtl;
+  chatsResponder = () => Promise.resolve(jsonResponse({ message: 'gateway timeout' }, 504));
+  renderChats();
+
+  const alert = await screen.findByRole('alert');
+  assert.match(alert.textContent ?? '', /Failed to load chats/);
+  assert.match(alert.textContent ?? '', /gateway timeout/);
+
+  chatsResponder = null;
+  fireEvent.click(within(alert).getByRole('button', { name: 'Retry' }));
+  await screen.findByText('Alice');
+  assert.equal(screen.queryByRole('alert') === null, true, 'the failure stayed after the list was read');
 });

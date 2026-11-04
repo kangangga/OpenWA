@@ -18,6 +18,7 @@ import {
   PollInput,
   ContactCard,
   MessageReaction,
+  MessageReceipts,
   Label,
   Channel,
   ChannelMessage,
@@ -40,6 +41,7 @@ import { LidMappingStore } from '../identity/lid-mapping-store.service';
 import { createLogger } from '../../common/services/logger.service';
 import { EngineNotReadyError } from '../../common/errors/engine-not-ready.error';
 import { ChannelMediaNotSupportedError } from '../../common/errors/channel-media-not-supported.error';
+import { markNothingSent } from '../../common/errors/engine-not-sent.error';
 import { WwebjsGroups } from './wwebjs-groups';
 import { type WwebjsEngineHost } from './wwebjs-host';
 import { registerWwebjsMessageEvents } from './wwebjs-message-events';
@@ -59,7 +61,7 @@ import { WwebjsChats } from './wwebjs-chats';
 import { WwebjsCatalog } from './wwebjs-catalog';
 import { registerWwebjsGroupEvents } from './wwebjs-group-events';
 import { WwebjsOnboardingWatcher } from './wwebjs-onboarding';
-import { WwebjsLifecycle } from './wwebjs-lifecycle';
+import { PAGE_RELOADING_MESSAGE, WwebjsLifecycle } from './wwebjs-lifecycle';
 import { WwebjsReadyReconcile } from './wwebjs-reconcile';
 import { WwebjsStuckAuth } from './wwebjs-stuck-auth';
 import { WwebjsCalls } from './wwebjs-calls';
@@ -587,6 +589,10 @@ export class WhatsAppWebJsAdapter implements IWhatsAppEngine {
     return this.contacts.resolveContactPhone(contactId);
   }
 
+  getContactLid(number: string): Promise<string | null> {
+    return this.contacts.getContactLid(number);
+  }
+
   getGroups(): Promise<Group[]> {
     return this.groups.getGroups();
   }
@@ -662,6 +668,10 @@ export class WhatsAppWebJsAdapter implements IWhatsAppEngine {
 
   getMessageReactions(chatId: string, messageId: string): Promise<MessageReaction[]> {
     return this.messaging.getMessageReactions(chatId, messageId);
+  }
+
+  getMessageReceipts(chatId: string, messageId: string): Promise<MessageReceipts> {
+    return this.messaging.getMessageReceipts(chatId, messageId);
   }
 
   // Labels (Phase 3) - WhatsApp Business only
@@ -840,6 +850,10 @@ export class WhatsAppWebJsAdapter implements IWhatsAppEngine {
     return this.groups.setGroupEphemeral(groupId, durationSec);
   }
 
+  setGroupMemberLabel(groupId: string, label: string): Promise<void> {
+    return this.groups.setGroupMemberLabel(groupId, label);
+  }
+
   getGroupMembershipRequests(groupId: string): Promise<GroupMembershipRequest[]> {
     return this.groups.getGroupMembershipRequests(groupId);
   }
@@ -960,11 +974,10 @@ export class WhatsAppWebJsAdapter implements IWhatsAppEngine {
     // Post-READY navigation window: window.WWebJS is gone until the re-inject completes, so every
     // delegate evaluate would die as a raw TypeError 500 (and five raw send failures latch the send
     // breaker for its 15-minute cooldown). Answer the same retryable 409 the pre-READY states get,
-    // naming the reload so the operator can tell this state from a plain disconnect (#1081).
-    if (this.lifecycle.isInNavigationReinjectWindow()) {
-      throw new EngineNotReadyError(
-        'WhatsApp Web is reloading its page and the session is re-injecting. Retry in a few seconds.',
-      );
+    // naming the reload so the operator can tell this state from a plain disconnect (#1081). Past the
+    // window the same holds for a reloaded page a liveness probe has read without its helpers.
+    if (this.lifecycle.isInNavigationReinjectWindow() || this.lifecycle.isPageWithoutHelpers()) {
+      throw new EngineNotReadyError(PAGE_RELOADING_MESSAGE);
     }
   }
 
@@ -973,7 +986,7 @@ export class WhatsAppWebJsAdapter implements IWhatsAppEngine {
     // upstream wwebjs#201823 — WA Web removed Msg.avParams). Text→channel works; media does not.
     // Fail fast with a typed 501 instead of surfacing the raw TypeError as a 500 (#673).
     if (isChannelJid(chatId)) {
-      throw new ChannelMediaNotSupportedError();
+      throw markNothingSent(new ChannelMediaNotSupportedError());
     }
   }
 }

@@ -19,7 +19,7 @@ import {
   LOCATION_TEXT_MAX_LENGTH,
   REACTION_EMOJI_MAX_LENGTH,
 } from '../../../modules/message/dto/message-actions.dto';
-import { chatIdSchema } from '../chat-id-schema';
+import { chatIdSchema, chatJidSchema } from '../chat-id-schema';
 import { defineTool, type AnyToolDescriptor } from '../tool-descriptor';
 
 const sessionId = z.string().min(1).describe('Session UUID (the session id, not the name)');
@@ -81,11 +81,24 @@ const customLinkPreviewSchema = z
       .max(CUSTOM_PREVIEW_TITLE_MAX_LENGTH)
       .describe('Required: WhatsApp renders no preview without a title.'),
     description: z.string().max(CUSTOM_PREVIEW_DESCRIPTION_MAX_LENGTH).optional(),
+    thumbnailUrl: z
+      .string()
+      .optional()
+      .describe('Preview image URL (http/https), fetched under the media SSRF rules; renders the large card.'),
+    thumbnailBase64: z
+      .string()
+      .optional()
+      .describe('Preview image as base64, at most 5 MiB decoded. Wins over thumbnailUrl.'),
+  })
+  .refine(p => hasValidMediaUrl({ url: p.thumbnailUrl, base64: p.thumbnailBase64 }), {
+    error: MEDIA_URL_MESSAGE,
+    path: ['thumbnailUrl'],
   })
   .optional()
   .describe(
-    'Attach a preview you supply instead of one fetched from the URL, so nothing is fetched and it ' +
-      'works for a URL the gateway cannot reach. Baileys only: whatsapp-web.js answers 501.',
+    'Attach a preview you supply instead of one fetched from the URL, so the page is not fetched and ' +
+      'it works for a URL the gateway cannot reach. Only an optional thumbnail image is fetched. ' +
+      'Baileys only: whatsapp-web.js answers 501.',
   );
 
 export function messageTools(message: MessageService): AnyToolDescriptor[] {
@@ -160,7 +173,7 @@ export function messageTools(message: MessageService): AnyToolDescriptor[] {
       sessionScoped: true,
       inputSchema: z.object({
         sessionId,
-        chatId: chatIdSchema.describe('Chat JID (e.g. 628123456789@c.us or groupId@g.us)'),
+        chatId: chatJidSchema.describe('Chat JID (e.g. 628123456789@c.us or groupId@g.us)'),
         text: z.string().min(1).max(MESSAGE_TEXT_MAX_LENGTH).describe('Text message content'),
         linkPreview: z
           .boolean()
@@ -193,7 +206,7 @@ export function messageTools(message: MessageService): AnyToolDescriptor[] {
       inputSchema: z
         .object({
           sessionId,
-          chatId: chatIdSchema.describe('Chat JID'),
+          chatId: chatJidSchema.describe('Chat JID'),
           url: mediaUrl('Image'),
           base64: z.string().optional().describe('Base64-encoded image data'),
           mimetype: z.string().optional().describe('MIME type (required when using base64)'),
@@ -225,7 +238,7 @@ export function messageTools(message: MessageService): AnyToolDescriptor[] {
       inputSchema: z
         .object({
           sessionId,
-          chatId: chatIdSchema.describe('Chat JID'),
+          chatId: chatJidSchema.describe('Chat JID'),
           url: mediaUrl('Video'),
           base64: z.string().optional().describe('Base64-encoded video data'),
           mimetype: z.string().optional().describe('MIME type (required when using base64)'),
@@ -257,7 +270,7 @@ export function messageTools(message: MessageService): AnyToolDescriptor[] {
       inputSchema: z
         .object({
           sessionId,
-          chatId: chatIdSchema.describe('Chat JID'),
+          chatId: chatJidSchema.describe('Chat JID'),
           url: mediaUrl('Audio'),
           base64: z.string().optional().describe('Base64-encoded audio data'),
           mimetype: z.string().optional().describe('MIME type (required when using base64)'),
@@ -291,7 +304,7 @@ export function messageTools(message: MessageService): AnyToolDescriptor[] {
       inputSchema: z
         .object({
           sessionId,
-          chatId: chatIdSchema.describe('Chat JID'),
+          chatId: chatJidSchema.describe('Chat JID'),
           url: mediaUrl('Document'),
           base64: z.string().optional().describe('Base64-encoded document data'),
           mimetype: z.string().optional().describe('MIME type (required when using base64)'),
@@ -322,7 +335,7 @@ export function messageTools(message: MessageService): AnyToolDescriptor[] {
       sessionScoped: true,
       inputSchema: z.object({
         sessionId,
-        chatId: chatIdSchema.describe('Chat JID'),
+        chatId: chatJidSchema.describe('Chat JID'),
         latitude: z.number().min(-90).max(90).describe('Latitude coordinate'),
         longitude: z.number().min(-180).max(180).describe('Longitude coordinate'),
         description: z.string().max(LOCATION_TEXT_MAX_LENGTH).optional().describe('Location label/description'),
@@ -348,7 +361,7 @@ export function messageTools(message: MessageService): AnyToolDescriptor[] {
       sessionScoped: true,
       inputSchema: z.object({
         sessionId,
-        chatId: chatIdSchema.describe('Chat JID'),
+        chatId: chatJidSchema.describe('Chat JID'),
         contactName: z.string().min(1).max(CONTACT_NAME_MAX_LENGTH).describe('Display name of the contact to share'),
         contactNumber: z
           .string()
@@ -375,7 +388,7 @@ export function messageTools(message: MessageService): AnyToolDescriptor[] {
       inputSchema: z
         .object({
           sessionId,
-          chatId: chatIdSchema.describe('Chat JID'),
+          chatId: chatJidSchema.describe('Chat JID'),
           url: mediaUrl('Sticker'),
           base64: z.string().optional().describe('Base64-encoded sticker data'),
           mimetype: z.string().optional().describe('MIME type (required when using base64)'),
@@ -407,7 +420,7 @@ export function messageTools(message: MessageService): AnyToolDescriptor[] {
       sessionScoped: true,
       inputSchema: z.object({
         sessionId,
-        chatId: chatIdSchema.describe('Chat JID'),
+        chatId: chatJidSchema.describe('Chat JID'),
         templateId: z.string().optional().describe('Template UUID'),
         templateName: z.string().optional().describe('Template name slug'),
         vars: z
@@ -435,7 +448,7 @@ export function messageTools(message: MessageService): AnyToolDescriptor[] {
       sessionScoped: true,
       inputSchema: z.object({
         sessionId,
-        chatId: chatIdSchema.describe('Chat JID'),
+        chatId: chatJidSchema.describe('Chat JID'),
         quotedMessageId: z.string().min(1).describe('ID of the message to quote/reply to'),
         text: z.string().min(1).max(MESSAGE_TEXT_MAX_LENGTH).describe('Reply text content'),
         mentions: mentionsSchema,
@@ -457,8 +470,8 @@ export function messageTools(message: MessageService): AnyToolDescriptor[] {
       sessionScoped: true,
       inputSchema: z.object({
         sessionId,
-        fromChatId: chatIdSchema.describe('Source chat JID'),
-        toChatId: chatIdSchema.describe('Destination chat JID'),
+        fromChatId: chatJidSchema.describe('Source chat JID'),
+        toChatId: chatJidSchema.describe('Destination chat JID'),
         messageId: z.string().min(1).describe('ID of the message to forward'),
       }),
       handler: input =>
@@ -478,7 +491,7 @@ export function messageTools(message: MessageService): AnyToolDescriptor[] {
       sessionScoped: true,
       inputSchema: z.object({
         sessionId,
-        chatId: chatIdSchema.describe('Chat JID containing the message'),
+        chatId: chatJidSchema.describe('Chat JID containing the message'),
         messageId: z.string().min(1).describe('ID of the message to react to'),
         emoji: z
           .string()

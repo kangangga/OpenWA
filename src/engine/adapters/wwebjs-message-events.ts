@@ -302,6 +302,9 @@ export function registerWwebjsMessageEvents(client: Client, host: WwebjsEngineHo
       host.logger.warn('Dropping an ack whose message id could not be read', { ack });
       return;
     }
+    // An ack is a receipt of a message the account sent. Only an explicit false is dropped: a build that
+    // renamed the field (#747) can leave it unreadable, and dropping there strands real acks at SENT.
+    if (msg.fromMe === false) return;
     // Map the whatsapp-web.js MessageAck integer to the neutral DeliveryStatus here, at the
     // adapter boundary, so no downstream consumer ever sees engine-specific ack codes. The chat is
     // derived as Message._getChatId derives it (the same direction flag the revoked handler uses),
@@ -396,6 +399,8 @@ export function registerWwebjsMessageEvents(client: Client, host: WwebjsEngineHo
         });
         return;
       }
+      // Sender clock, in milliseconds. Without it a re-delivered vote gets a fresh stamp and so a fresh key.
+      const interactedAtMs = Math.floor(Number(vote.interractedAtTs) || Date.now());
       const event: PollVoteEvent = {
         pollMessageId: readWid(pollId) ?? readWid(raw.parentMsgKey) ?? '',
         // Direction flag, as Message._getChatId (see message_revoke_everyone).
@@ -403,7 +408,8 @@ export function registerWwebjsMessageEvents(client: Client, host: WwebjsEngineHo
         voterId: readWid(raw.voter) ?? '',
         selectedOptions,
         ...(poll?.pollName ? { pollName: poll.pollName } : {}),
-        timestamp: Math.floor((Number(vote.interractedAtTs) || Date.now()) / 1000),
+        timestamp: Math.floor(interactedAtMs / 1000),
+        timestampMs: interactedAtMs,
       };
       host.getCallbacks().onPollVote?.(event);
     } catch (error) {

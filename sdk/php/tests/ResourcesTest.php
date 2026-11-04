@@ -137,6 +137,16 @@ class ResourcesTest extends TestCase
         $this->assertStringContainsString('/revoke', $backend->calls()[4]['url']);
     }
 
+    public function testGroupSetMemberLabel(): void
+    {
+        $backend = new MockBackend();
+        $backend->on(200, ['success' => true]);
+        $client = $backend->makeClient();
+        $client->groups->setMemberLabel('s', 'g@g.us', 'Site A');
+        $this->assertRequest($backend, 'PUT', '/api/sessions/s/groups/g@g.us/member-label');
+        $this->assertSame(['label' => 'Site A'], $backend->lastCall()['body']);
+    }
+
     public function testGroupJoinAndSettings(): void
     {
         $backend = new MockBackend();
@@ -178,6 +188,16 @@ class ResourcesTest extends TestCase
         $this->assertRequest($backend, 'GET', '/api/sessions/s/contacts/a@c.us/profile-picture');
         $client->contacts->phone('s', 'x@lid');
         $this->assertRequest($backend, 'GET', '/api/sessions/s/contacts/x@lid/phone');
+    }
+
+    public function testContactLid(): void
+    {
+        $backend = new MockBackend();
+        $backend->on(200, ['number' => '628123', 'lid' => null]);
+        $client = $backend->makeClient();
+        $res = $client->contacts->lid('s', '628123');
+        $this->assertRequest($backend, 'GET', '/api/sessions/s/contacts/628123/lid');
+        $this->assertNull($res['lid']);
     }
 
     public function testBlockUnblock(): void

@@ -340,6 +340,13 @@ describe('validateEnv', () => {
     expect(() => validateEnv({ DATABASE_SSL: 'require' })).toThrow(/DATABASE_SSL/);
     expect(() => validateEnv({ DATABASE_SSL_REJECT_UNAUTHORIZED: '0' })).toThrow(/DATABASE_SSL_REJECT_UNAUTHORIZED/);
     expect(() => validateEnv({ MAIN_DATABASE_SYNCHRONIZE: 'False' })).toThrow(/MAIN_DATABASE_SYNCHRONIZE/);
+    // The data connection's flag: any spelling but `true` ran the SQLite migration chain instead.
+    for (const typo of ['True', 'TRUE', '1', 'yes']) {
+      expect(() => validateEnv({ DATABASE_SYNCHRONIZE: typo })).toThrow(/DATABASE_SYNCHRONIZE must be "true"/);
+    }
+    for (const ok of ['true', 'false', '']) {
+      expect(() => validateEnv({ DATABASE_SYNCHRONIZE: ok })).not.toThrow();
+    }
     expect(() => validateEnv({ ALLOW_UNSIGNED_INGRESS: 'yes' })).toThrow(/ALLOW_UNSIGNED_INGRESS/);
     expect(() => validateEnv({ ALLOW_DEV_API_KEY: '1' })).toThrow(/ALLOW_DEV_API_KEY/);
     expect(() => validateEnv({ WEBHOOK_SSRF_PROTECT: 'off' })).toThrow(/WEBHOOK_SSRF_PROTECT/);
@@ -425,6 +432,12 @@ describe('validateEnv', () => {
     expect(() => validateEnv({ SEARCH_PROVIDER: 'none' })).not.toThrow();
     // Unset is accepted (the configuration default of 'auto' applies downstream).
     expect(() => validateEnv({})).not.toThrow();
+  });
+
+  it('rejects a SEARCH_CONTAINS_ENABLED typo instead of silently leaving contains search off', () => {
+    expect(() => validateEnv({ SEARCH_CONTAINS_ENABLED: 'yes' })).toThrow(/SEARCH_CONTAINS_ENABLED/);
+    expect(() => validateEnv({ SEARCH_CONTAINS_ENABLED: 'true' })).not.toThrow();
+    expect(() => validateEnv({ SEARCH_CONTAINS_ENABLED: '' })).not.toThrow();
   });
 
   it('rejects a LOG_LEVEL misspelling instead of silently logging at info', () => {

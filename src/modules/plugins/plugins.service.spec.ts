@@ -388,7 +388,7 @@ describe('PluginsService — install / uninstall (real loader + disk)', () => {
     let calls = 0;
     jest.spyOn(loader, 'uninstallPlugin').mockImplementation(() => {
       calls++;
-      return calls === 1 ? firstDone : Promise.resolve();
+      return (calls === 1 ? firstDone : Promise.resolve()).then(() => ({ registryEntryKept: false }));
     });
 
     const p1 = service.uninstall('svc-plg');
@@ -698,6 +698,60 @@ describe('PluginsService — per-session config', () => {
     expect(loader.getPlugin('sess-cfg')?.sessionConfig?.['sess-A']).toEqual({ apiKey: 'A-secret', lang: 'en' });
   });
 
+  // A session-restricted admin may write a session's override but cannot read its secrets, which come back masked.
+  // Echoing the mask must not retarget a stored secret: it belongs to the host it was saved for.
+  describe('with a host key the plugin may call', () => {
+    const hostManifest = {
+      ...manifest,
+      id: 'sess-host',
+      net: { allowConfigHosts: ['baseUrl'] },
+      configSchema: {
+        type: 'object',
+        properties: { baseUrl: { type: 'string' }, apiKey: { type: 'string', secret: true } },
+      },
+    };
+    const slice = () => loader.getPlugin('sess-host')?.sessionConfig?.['sess-A'];
+
+    beforeEach(() => {
+      const z = new AdmZip();
+      z.addFile('manifest.json', Buffer.from(JSON.stringify(hostManifest)));
+      z.addFile('index.js', Buffer.from('module.exports = class {};'));
+      service.install({ buffer: z.toBuffer() });
+      service.updateSessionConfig('sess-host', 'sess-A', { baseUrl: 'https://tenant.example', apiKey: 'TENANT' });
+    });
+
+    it('keeps restoring the stored secret while the write names the same host', () => {
+      service.updateSessionConfig('sess-host', 'sess-A', { baseUrl: 'https://tenant.example/v2', apiKey: '***' });
+      expect(slice()).toEqual({ baseUrl: 'https://tenant.example/v2', apiKey: 'TENANT' });
+    });
+
+    it('drops a masked or blank secret in a write that points the host at another origin', () => {
+      for (const echoed of ['***', '']) {
+        service.updateSessionConfig('sess-host', 'sess-A', { baseUrl: 'https://tenant.example', apiKey: 'TENANT' });
+        service.updateSessionConfig('sess-host', 'sess-A', { baseUrl: 'https://attacker.example', apiKey: echoed });
+        expect(slice()).toEqual({ baseUrl: 'https://attacker.example' });
+      }
+    });
+
+    // The override names no host, so it resolves to the base host; a write that names that host moves nothing.
+    it('judges a write against the base host when the stored override names none', () => {
+      service.updateConfig('sess-host', { baseUrl: 'https://base.example', apiKey: 'BASE' });
+      service.updateSessionConfig('sess-host', 'sess-A', { apiKey: 'OWN' });
+
+      service.updateSessionConfig('sess-host', 'sess-A', { baseUrl: 'https://base.example/', apiKey: '***' });
+      expect(slice()).toEqual({ baseUrl: 'https://base.example/', apiKey: 'OWN' });
+
+      service.updateSessionConfig('sess-host', 'sess-A', { apiKey: 'OWN' });
+      service.updateSessionConfig('sess-host', 'sess-A', { baseUrl: 'https://attacker.example', apiKey: '***' });
+      expect(slice()).toEqual({ baseUrl: 'https://attacker.example' });
+    });
+
+    it('stores a secret the write brings itself, whatever the host', () => {
+      service.updateSessionConfig('sess-host', 'sess-A', { baseUrl: 'https://other.example', apiKey: 'NEW' });
+      expect(slice()).toEqual({ baseUrl: 'https://other.example', apiKey: 'NEW' });
+    });
+  });
+
   // A write is merged over the stored base config, so a removed secret has to travel as null; an empty
   // string is not a removal.
   it('removes the base secret on an explicit null and keeps it on an empty string', () => {
@@ -1004,7 +1058,8 @@ describe('PluginsService: disable an engine plugin', () => {
 
 /**
  * Recovery for a plugin the gateway still has a registry entry for but whose code is gone — the
- * state the loader announces on every boot ("Reinstall it — its config and stored data are kept").
+ * state the loader announces on every boot ("Reinstall it: its config and stored data are kept, unless an
+ * uninstall stopped part-way").
  *
  * Under the shipped layout `plugins.dir` IS `<dataDir>/plugins`, so a plugin's package directory and
  * its `ctx.storage` directory are the same path. `ctx.storage` is created eagerly the first time the

@@ -10,6 +10,7 @@ import {
   IsBoolean,
   IsObject,
   Validate,
+  Matches,
 } from 'class-validator';
 import { Type } from 'class-transformer';
 import { IsMentionWidConstraint } from './is-mention-wid.validator';
@@ -107,6 +108,26 @@ export class CustomLinkPreviewDto {
   @IsString()
   @MaxLength(CUSTOM_PREVIEW_DESCRIPTION_MAX_LENGTH)
   description?: string;
+
+  @ApiPropertyOptional({
+    description:
+      'Preview image URL (http/https), fetched by the gateway under the same SSRF rules as a media URL. ' +
+      'Rendered as the large preview card. At most 5 MiB.',
+    example: 'https://example.com/launch.jpg',
+  })
+  @IsOptional()
+  // base64 wins when it holds data, as on the media routes, so a url next to it is not fetched and not checked.
+  @IsMediaUrl<CustomLinkPreviewDto>({ ignoreWhen: o => !!stripBase64DataUri(o.thumbnailBase64) })
+  thumbnailUrl?: string;
+
+  @ApiPropertyOptional({
+    description:
+      'Preview image as base64, with or without a data: prefix. Wins over thumbnailUrl. At most 5 MiB decoded.',
+  })
+  @IsOptional()
+  @ToStrictString()
+  @IsString()
+  thumbnailBase64?: string;
 }
 
 export class SendTextMessageDto {
@@ -119,6 +140,7 @@ export class SendTextMessageDto {
   @IsString()
   @IsNotEmpty()
   @MaxLength(CHAT_ID_MAX_LENGTH)
+  @Matches(CHAT_JID_PATTERN, { message: CHAT_JID_MESSAGE })
   chatId!: string;
 
   @ApiProperty({
@@ -166,8 +188,9 @@ export class SendTextMessageDto {
   @ApiPropertyOptional({
     type: CustomLinkPreviewDto,
     description:
-      'Attach a preview you supply yourself, instead of one fetched from the URL. Nothing is ' +
-      'fetched for these, so a preview can be attached even for a URL this server cannot reach. ' +
+      'Attach a preview you supply yourself, instead of one fetched from the URL. The page at `url` ' +
+      'is never fetched, so a preview can be attached even for a URL this server cannot reach; only ' +
+      'a `thumbnailUrl`, when given, is. ' +
       '**Baileys only** — whatsapp-web.js takes a boolean and answers `501`. Cannot be combined ' +
       'with `linkPreview: false`, which asks for the opposite.',
   })
@@ -225,6 +248,7 @@ export class SendMediaMessageDto {
   @IsString()
   @IsNotEmpty()
   @MaxLength(CHAT_ID_MAX_LENGTH)
+  @Matches(CHAT_JID_PATTERN, { message: CHAT_JID_MESSAGE })
   chatId!: string;
 
   @ApiPropertyOptional({

@@ -48,6 +48,8 @@ describe('GroupService', () => {
       ["the account's own 1:1 jid", '628123456789@c.us'],
       ['a lid', '99887766@lid'],
       ['a channel', '120363000000000000@newsletter'],
+      ['a 1:1 jid with a group domain appended', '628123456789@c.us@g.us'],
+      ['a device jid with a group domain appended', '628123456789:5@c.us@g.us'],
     ])('refuses %s', (_label, id) => {
       const e = engine();
       const svc = makeService(e);
@@ -75,6 +77,59 @@ describe('GroupService', () => {
 
       expect(e.deleteGroupPicture).toHaveBeenCalledWith('123456789-987654321@g.us');
       expect(e.getProfilePicture).toHaveBeenCalledWith('123456789-987654321@g.us');
+    });
+  });
+
+  // Baileys relays the label as a message to whatever jid it is handed, so a 1:1 id would put a group
+  // protocol message in a person's chat.
+  describe('setGroupMemberLabel', () => {
+    it.each([
+      ['a 1:1 jid', '628123456789@c.us'],
+      ['a lid', '99887766@lid'],
+      ['a channel', '120363000000000000@newsletter'],
+      // Baileys reads the domain after the first `@`, so a second one is refused wherever it sits.
+      ['a 1:1 jid with a group domain appended', '628123456789@c.us@g.us'],
+      ['a protocol-dialect jid with a group domain appended', '628123456789@s.whatsapp.net@g.us'],
+      ['a device jid with a group domain appended', '628123456789:5@c.us@g.us'],
+    ])('refuses %s before it reaches the engine', (_label, id) => {
+      const setGroupMemberLabel = jest.fn().mockResolvedValue(undefined);
+      const svc = makeService({ setGroupMemberLabel });
+
+      expect(() => svc.setGroupMemberLabel('s1', id, 'Site A')).toThrow(BadRequestException);
+      expect(setGroupMemberLabel).not.toHaveBeenCalled();
+    });
+
+    it('forwards a group id and the label, an empty one included', async () => {
+      const setGroupMemberLabel = jest.fn().mockResolvedValue(undefined);
+      const svc = makeService({ setGroupMemberLabel });
+
+      await svc.setGroupMemberLabel('s1', '120363000000000001@g.us', 'Site A Management');
+      await svc.setGroupMemberLabel('s1', '120363000000000001@g.us', '');
+
+      expect(setGroupMemberLabel).toHaveBeenNthCalledWith(1, '120363000000000001@g.us', 'Site A Management');
+      expect(setGroupMemberLabel).toHaveBeenNthCalledWith(2, '120363000000000001@g.us', '');
+    });
+
+    it.each(['120363000000000001@G.US', ' 120363000000000001@g.us ', '120363000000000001:5@g.us'])(
+      'hands the engine the group id %j in the form Baileys relays to a group',
+      async id => {
+        const setGroupMemberLabel = jest.fn().mockResolvedValue(undefined);
+        const svc = makeService({ setGroupMemberLabel });
+
+        await svc.setGroupMemberLabel('s1', id, 'Site A');
+
+        expect(setGroupMemberLabel).toHaveBeenCalledWith('120363000000000001@g.us', 'Site A');
+      },
+    );
+
+    it('lets the whatsapp-web.js 501 through', async () => {
+      const svc = makeService({
+        setGroupMemberLabel: jest.fn().mockRejectedValue(new EngineNotSupportedError('setGroupMemberLabel')),
+      });
+
+      await expect(svc.setGroupMemberLabel('s1', '120363000000000001@g.us', 'Site A')).rejects.toBeInstanceOf(
+        EngineNotSupportedError,
+      );
     });
   });
 

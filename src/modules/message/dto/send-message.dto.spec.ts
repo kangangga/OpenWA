@@ -313,6 +313,20 @@ describe('SendTextMessageDto customLinkPreview', () => {
   it.each([[[]], [[preview]]])('refuses an array: %j', async value => {
     expect(await previewErrors(value)).toHaveLength(1);
   });
+
+  it('accepts a preview image as an http(s) URL or as base64', async () => {
+    expect(await previewErrors({ ...preview, thumbnailUrl: 'https://cdn.example/a.jpg' })).toHaveLength(0);
+    expect(await previewErrors({ ...preview, thumbnailBase64: 'AAAA' })).toHaveLength(0);
+  });
+
+  it('refuses a preview image URL that is not http(s)', async () => {
+    expect(await previewErrors({ ...preview, thumbnailUrl: 'file:///etc/passwd' })).toHaveLength(1);
+  });
+
+  // base64 wins, as on the media routes, so the URL beside it is never fetched and not checked.
+  it('does not check a preview image URL beside a base64', async () => {
+    expect(await previewErrors({ ...preview, thumbnailUrl: 'not a url', thumbnailBase64: 'AAAA' })).toHaveLength(0);
+  });
 });
 
 // Implicit conversion rewrote a boolean or an object into its string form before @IsString ran, so
@@ -355,7 +369,7 @@ describe('string fields refuse a boolean or an object', () => {
     expect(contact.contactNumber).toBe('628999888777');
     expect(await validate(contact, GLOBAL_VALIDATION_OPTIONS)).toHaveLength(0);
 
-    expect(await validateDto(SendTextMessageDto, { chatId: 628123456789, text: 5 })).toHaveLength(0);
+    expect(await validateDto(SendTextMessageDto, { chatId: 'g@g.us', text: 5 })).toHaveLength(0);
   });
 
   it('still takes the same values spelled as strings', async () => {

@@ -303,6 +303,36 @@ describe('ingress dispatch does not carry a base secret to another host', () => 
     expect(calls[0].config).toEqual({ baseUrl: 'https://attacker.example' });
   });
 
+  // The row's token was provisioned against the operator host. An override written for the same session by a
+  // key that cannot read it must not be able to move the host and take the row's token along.
+  it('withholds the token an instance holds itself when a session override moved the host', async () => {
+    const tenant = instanceRow('tenant', { apiToken: 'TENANT-TOKEN', inboxId: '9' }, 'S1');
+    const { bridge, calls } = makeBridge({
+      rows: [tenant],
+      baseConfig,
+      sessionConfig: { S1: { baseUrl: 'https://attacker.example' } },
+      manifestOverrides: adapter,
+    });
+
+    await bridge.dispatchWebhookForInstance(job('tenant', 'S1'));
+
+    expect(calls[0].config).toEqual({ baseUrl: 'https://attacker.example', inboxId: '9' });
+  });
+
+  it('keeps the token an instance holds itself when the override left the host alone', async () => {
+    const tenant = instanceRow('tenant', { apiToken: 'TENANT-TOKEN' }, 'S1');
+    const { bridge, calls } = makeBridge({
+      rows: [tenant],
+      baseConfig,
+      sessionConfig: { S1: { baseUrl: 'https://chat.example.com/' } },
+      manifestOverrides: adapter,
+    });
+
+    await bridge.dispatchWebhookForInstance(job('tenant', 'S1'));
+
+    expect(calls[0].config).toMatchObject({ apiToken: 'TENANT-TOKEN' });
+  });
+
   it('keeps the token for an instance that names the operator host or none', async () => {
     const same = instanceRow('same', { baseUrl: 'https://chat.example.com/other' }, 'S1');
     const none = instanceRow('none', {}, 'S2');
@@ -406,6 +436,47 @@ describe('ingress dispatch keeps what was decided when the delivery was admitted
       expect(calls[0].verified).toBe(want);
     },
   );
+
+  it('does not label a delivery carried in the query string verified when it predates the recorded verdict', async () => {
+    const { bridge, calls } = makeBridge({
+      rows: [row()],
+      manifestOverrides: { ingress: [route('hmac-sha256')] },
+    });
+    const queryBorne = job('acct-a', 'S1');
+    queryBorne.payload = { ...queryBorne.payload, query: { text: 'hello' }, body: '', rawBody: '' };
+
+    await bridge.dispatchWebhookForInstance(queryBorne);
+
+    expect(calls[0].verified).toBe(false);
+  });
+
+  it('does not keep a query-borne delivery verified that an earlier release admitted as verified', async () => {
+    const { bridge, calls } = makeBridge({
+      rows: [row()],
+      manifestOverrides: { ingress: [route('hmac-sha256')] },
+    });
+    const queryBorne = job('acct-a', 'S1', { verified: true });
+    queryBorne.payload = { ...queryBorne.payload, query: { text: 'hello' }, body: '', rawBody: '' };
+
+    await bridge.dispatchWebhookForInstance(queryBorne);
+
+    expect(calls[0].verified).toBe(false);
+  });
+
+  it('keeps a query-borne delivery verified on a shared-secret route', async () => {
+    const { bridge, calls } = makeBridge({
+      rows: [row()],
+      manifestOverrides: {
+        ingress: [{ ...route('hmac-sha256'), signature: { scheme: 'shared-secret' as const, header: 'x-token' } }],
+      },
+    });
+    const queryBorne = job('acct-a', 'S1', { verified: true });
+    queryBorne.payload = { ...queryBorne.payload, query: { text: 'hello' }, body: '', rawBody: '' };
+
+    await bridge.dispatchWebhookForInstance(queryBorne);
+
+    expect(calls[0].verified).toBe(true);
+  });
 
   it('refuses a delivery admitted for a session the instance has since left', async () => {
     const rebound = instanceRow('acct-a', { apiToken: 'token-A' }, 'S-new');

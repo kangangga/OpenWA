@@ -225,10 +225,10 @@ export function validateEnv(config: EnvConfig): EnvConfig {
     // POSTGRES_SCHEMA is optional (defaults to 'public' in configuration.ts). When set, validate it
     // is a legal, non-reserved Postgres identifier so a typo / injection-ish value fails fast at boot
     // rather than reaching CREATE TABLE "<schema>"."..." (or a search_path SET) at migration time.
-    // Lower case only: the search_path startup option is unquoted, so Postgres folds it to lower
-    // case, while TypeORM quotes the schema. A mixed-case name would split DDL and queries across
-    // two schemas. The raw value is checked, untrimmed: the app and the migration CLI both use it
-    // as set, so a padded (or whitespace-only) value must fail here as it fails in the CLI.
+    // Lower case only: the search_path the app sets with set_config on connect is unquoted, so Postgres
+    // folds it to lower case, while TypeORM quotes the schema. A mixed-case name would split DDL and
+    // queries across two schemas. The raw value is checked, untrimmed: the app and the migration CLI both
+    // use it as set, so a padded (or whitespace-only) value must fail here as it fails in the CLI.
     const pgSchema = config.POSTGRES_SCHEMA;
     const pgSchemaError = typeof pgSchema === 'string' && pgSchema !== '' ? postgresSchemaError(pgSchema) : null;
     if (pgSchemaError) {
@@ -676,6 +676,7 @@ export function validateEnv(config: EnvConfig): EnvConfig {
     'RESOLVE_LID_TO_PHONE',
     'SIMULATE_TYPING',
     'SEARCH_ENABLED',
+    'SEARCH_CONTAINS_ENABLED',
     // Read at boot by the throttler factory (app.module.ts) and CacheService with `=== 'true'`: a
     // typo like `ture` silently downgrades rate-limit storage + cache to per-process in-memory.
     'REDIS_ENABLED',
@@ -704,6 +705,8 @@ export function validateEnv(config: EnvConfig): EnvConfig {
     // `=== 'true'`: a typo keeps the main connection on its migrations, so an operator who meant to
     // opt into synchronize for api_keys/audit_logs silently does not get it.
     'MAIN_DATABASE_SYNCHRONIZE',
+    // Same for the data connection: on SQLite a typo silently runs the migration chain instead.
+    'DATABASE_SYNCHRONIZE',
     // Read with `=== 'true'` by the plugin ingress gate: a typo turns an intentional
     // `ALLOW_UNSIGNED_INGRESS=true` back off, and a route the operator meant to open stops loading.
     'ALLOW_UNSIGNED_INGRESS',

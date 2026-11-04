@@ -4,6 +4,7 @@ import { PresenceStore } from './presence-store.service';
 import { Test, TestingModule } from '@nestjs/testing';
 import { getRepositoryToken, getDataSourceToken } from '@nestjs/typeorm';
 import { Repository, DataSource, In, IsNull, LessThanOrEqual, Not, Or, QueryFailedError } from 'typeorm';
+import type { QueryDeepPartialEntity } from 'typeorm/query-builder/QueryPartialEntity';
 import {
   NotFoundException,
   ConflictException,
@@ -12,9 +13,11 @@ import {
   GatewayTimeoutException,
   HttpException,
   HttpStatus,
+  ServiceUnavailableException,
 } from '@nestjs/common';
 import { EngineTransportError } from '../../common/errors/engine-transport.error';
 import { EngineNotSupportedError } from '../../common/errors/engine-not-supported.error';
+import { EngineNotReadyError } from '../../common/errors/engine-not-ready.error';
 import { ConfigService } from '@nestjs/config';
 import { SessionService, AUTOSTART_SHUTDOWN_WAIT_MS, AUTOSTART_THROTTLE_MS } from './session.service';
 import { SessionOwnershipService } from './session-ownership.service';
@@ -81,6 +84,7 @@ import {
   GroupEvent,
   IncomingCallEvent,
   InboundTicket,
+  StoredChatMessageLookup,
 } from '../../engine/interfaces/whatsapp-engine.interface';
 import { BaileysSessionStore } from '../../engine/adapters/baileys-session-store';
 import {
@@ -304,6 +308,7 @@ describe('SessionService', () => {
       lidsForPhone: jest.fn().mockReturnValue([]),
       findPhoneForLid: jest.fn().mockResolvedValue(null),
       findLidsForPhone: jest.fn().mockResolvedValue([]),
+      onSecondLid: jest.fn(),
     };
 
     statusStore = {
@@ -645,6 +650,28 @@ describe('SessionService', () => {
       // credentials were torn down, so re-entering boot auto-start would only resurrect a session
       // that can no longer reach READY.
       expect(repository.update).toHaveBeenCalledWith('sess-uuid-1', { phone: null });
+    });
+
+    // A session with no linked device has nothing to remove: its engine refuses the logout as not ready, and
+    // that refusal answers instead of the 502, whose advice to start the session and retry would only repeat.
+    it('logout() answers the 409 of a session with no linked device, after the same local teardown', async () => {
+      (repository.findOne as jest.Mock).mockResolvedValue(createMockSession());
+      (repository.update as jest.Mock).mockResolvedValue({ affected: 1 });
+      const refusal = new EngineNotReadyError(
+        'This session has no linked WhatsApp device, so there is nothing to unlink.',
+      );
+      const engine = { logout: jest.fn().mockRejectedValue(refusal) };
+      enginesOf().set('sess-uuid-1', engine);
+
+      const thrown = await service.logout('sess-uuid-1').catch((e: unknown) => e);
+
+      expect(thrown).toBe(refusal);
+      expect(enginesOf().has('sess-uuid-1')).toBe(false);
+      expect(repository.update).toHaveBeenCalledWith('sess-uuid-1', { phone: null });
+      expect(repository.update).toHaveBeenCalledWith(
+        'sess-uuid-1',
+        expect.objectContaining({ status: SessionStatus.DISCONNECTED }),
+      );
     });
 
     it('logout() rejects with 400 when no engine is loaded (session already stopped) and does NOT clear phone', async () => {
@@ -1949,6 +1976,37 @@ describe('SessionService', () => {
       expect(ownership.release.mock.calls.length).toBeGreaterThan(releasesBefore);
     });
 
+    // A claim that could not be written launched nothing, so the start answers the retryable 503 a delete
+    // answers for the same failure, not a 500.
+    it('start() answers 503 and launches nothing when its claim cannot be written', async () => {
+      const ownership = withOwnership();
+      (repository.findOne as jest.Mock).mockResolvedValue(createMockSession());
+      ownership.claim.mockRejectedValueOnce(new Error('Connection terminated unexpectedly'));
+
+      await expect(service.start('sess-uuid-1', { explicit: true })).rejects.toBeInstanceOf(
+        ServiceUnavailableException,
+      );
+
+      expect(mockEngine.initialize).not.toHaveBeenCalled();
+      expect(lifecycle.isEngineActive('sess-uuid-1')).toBe(false);
+    });
+
+    it('start() answers 503 when the re-claim of its one retry cannot be written', async () => {
+      const ownership = withOwnership();
+      (repository.findOne as jest.Mock).mockResolvedValue(createMockSession());
+      (repository.update as jest.Mock).mockResolvedValue({ affected: 1 });
+      (engineFactory.create as jest.Mock).mockClear().mockReturnValue(mockEngine);
+      mockEngine.initialize.mockRejectedValueOnce(new EngineTransportError('Protocol error: Target closed'));
+      ownership.claim
+        .mockResolvedValueOnce(true)
+        .mockRejectedValueOnce(new Error('Connection terminated unexpectedly'));
+
+      await expect(service.start('sess-uuid-1')).rejects.toBeInstanceOf(ServiceUnavailableException);
+
+      expect(mockEngine.initialize).toHaveBeenCalledTimes(1);
+      expect(lifecycle.isEngineActive('sess-uuid-1')).toBe(false);
+    });
+
     // The same race with a force-kill: the start sent while the engine still ran launched a new one
     // once its claim resolved and cleared the stop record the kill had just written.
     it.each([false, true])('retires a pending start after logout (incomplete: %s)', async incomplete => {
@@ -2474,7 +2532,11 @@ describe('SessionService', () => {
 
     it('logout() releases on the 502-incomplete path too — the engine is down either way', async () => {
       const ownership = withOwnership();
-      jest.spyOn(lifecycle, 'logout').mockRejectedValue(new BadGatewayException('incomplete'));
+      // The 502 comes once the engine was found and torn down, as in SessionEngineControls.logout.
+      jest.spyOn(lifecycle, 'logout').mockImplementation((_id, hooks) => {
+        hooks?.onEngineFound?.();
+        return Promise.reject(new BadGatewayException('incomplete'));
+      });
       jest.spyOn(lifecycle, 'isEngineActive').mockReturnValue(false);
 
       await expect(service.logout('sess-uuid-1')).rejects.toThrow(BadGatewayException);
@@ -3142,6 +3204,19 @@ describe('SessionService', () => {
         (repository.findOne as jest.Mock).mockResolvedValue(createMockSession({ id: row.id }));
 
         await expect(call(service, row.id)).rejects.toThrow(BadRequestException);
+
+        expect(await nodeIdOf(row.id)).toBe('dead-node');
+      });
+
+      // A failed read of the row took nothing down either.
+      it.each([
+        ['logout', (s: SessionService, id: string) => s.logout(id)],
+        ['forceKill', (s: SessionService, id: string) => s.forceKill(id)],
+      ])('%s() whose row read fails keeps a lapsed foreign claim', async (_verb, call) => {
+        const row = await seed({ nodeId: 'dead-node', leaseExpiresAt: new Date(Date.now() - 60_000) });
+        (repository.findOne as jest.Mock).mockRejectedValueOnce(new Error('Connection terminated unexpectedly'));
+
+        await expect(call(service, row.id)).rejects.toThrow('Connection terminated unexpectedly');
 
         expect(await nodeIdOf(row.id)).toBe('dead-node');
       });
@@ -5894,6 +5969,66 @@ describe('SessionService', () => {
       });
     });
 
+    // Baileys subscribes a phone through the contact's lid once it knows one, and WhatsApp then reports
+    // presence from that lid, so the report is stored under the lid and not under the id subscribed.
+    describe('a read in another form of the reported chat', () => {
+      const PHONE = '628111222333';
+      const LID = '123456789012345';
+      const report = (chatId: string) => ({ chatId, participants: [{ id: chatId, state: 'composing' as const }] });
+
+      beforeEach(() => {
+        (lidMappingStore.findLidsForPhone as jest.Mock).mockImplementation((phone: string) =>
+          Promise.resolve(phone === PHONE ? [LID] : []),
+        );
+        (lidMappingStore.findPhoneForLid as jest.Mock).mockImplementation((lid: string) =>
+          Promise.resolve(lid.startsWith(LID) ? PHONE : null),
+        );
+      });
+
+      it('serves a report stored under the lid paired with the phone it is read by', async () => {
+        const callbacks = await startAndCapture();
+        callbacks.onPresenceUpdate?.(report(`${LID}@lid`));
+
+        await expect(service.getPresence('sess-uuid-1', `${PHONE}@c.us`)).resolves.toMatchObject(report(`${LID}@lid`));
+      });
+
+      it('serves a report stored under the phone to a read by its lid', async () => {
+        const callbacks = await startAndCapture();
+        callbacks.onPresenceUpdate?.(report(`${PHONE}@c.us`));
+
+        await expect(service.getPresence('sess-uuid-1', `${LID}@lid`)).resolves.toMatchObject(report(`${PHONE}@c.us`));
+      });
+
+      // The subscribe route accepts every spelling of an id, while reports are stored under the neutral one.
+      it.each([`${PHONE}@s.whatsapp.net`, `${PHONE}:12@c.us`, `${PHONE}@C.US`])(
+        'serves a read spelled %s',
+        async id => {
+          const callbacks = await startAndCapture();
+          callbacks.onPresenceUpdate?.(report(`${PHONE}@c.us`));
+
+          await expect(service.getPresence('sess-uuid-1', id)).resolves.toMatchObject(report(`${PHONE}@c.us`));
+        },
+      );
+
+      it('serves the newest report when the phone and its lid both have one', async () => {
+        const callbacks = await startAndCapture();
+        callbacks.onPresenceUpdate?.(report(`${PHONE}@c.us`));
+        await new Promise(resolve => setTimeout(resolve, 5));
+        callbacks.onPresenceUpdate?.(report(`${LID}@lid`));
+
+        await expect(service.getPresence('sess-uuid-1', `${PHONE}@c.us`)).resolves.toMatchObject({
+          chatId: `${LID}@lid`,
+        });
+      });
+
+      it('serves nothing for a lid that is not paired with the phone read', async () => {
+        const callbacks = await startAndCapture();
+        callbacks.onPresenceUpdate?.(report('999999999999999@lid'));
+
+        await expect(service.getPresence('sess-uuid-1', `${PHONE}@c.us`)).resolves.toBeNull();
+      });
+    });
+
     // Subscribed but quiet is a normal state, not a missing resource.
     it('reports null for a chat nothing was reported for', async () => {
       await startAndCapture();
@@ -6078,10 +6213,10 @@ describe('SessionService', () => {
 
     // A terminal unlink leaves credentials that can never reach READY again, so the row must leave
     // the boot auto-start query and the takeover sweep (both key on a non-null phone), exactly as
-    // logout() already ensures. The in-process reconnect still shows one QR: scheduleReconnect gets
-    // the row object captured before the write, so its previouslyLinked flag survives.
+    // logout() already ensures. The in-process reconnect still shows one QR, and starts from the row
+    // as the clear left it: the phone is the account binding, and the unlink ended it.
     it.each(['LOGOUT', 'UNPAIRED', 'UNPAIRED_IDLE', 'logged out'])(
-      'clears phone on a terminal unlink (%s) without touching the captured reconnect row',
+      'clears phone on a terminal unlink (%s), for the row and for the reconnect it schedules',
       async reason => {
         const callbacks = await startAndCapture();
         const reconnectSpy = jest
@@ -6094,7 +6229,7 @@ describe('SessionService', () => {
 
         expect(repository.update).toHaveBeenCalledWith('sess-uuid-1', { phone: null });
         const [, passedSession] = reconnectSpy.mock.calls[0] as [string, Session];
-        expect(passedSession.phone).toBe('628123');
+        expect(passedSession.phone).toBeNull();
       },
     );
 
@@ -8981,8 +9116,9 @@ describe('SessionService', () => {
       const result = await service.sendSeen('sess-uuid-1', '123@c.us');
 
       // Second argument is the optional messageIds, absent here — the engine falls back to the
-      // newest message it still holds.
-      expect(mockEngine.sendSeen).toHaveBeenCalledWith('123@c.us', undefined, undefined);
+      // newest message it still holds, else to the stored lookup it is handed. The third, the senders
+      // of a group's named messages, is absent too.
+      expect(mockEngine.sendSeen).toHaveBeenCalledWith('123@c.us', undefined, undefined, expect.any(Function));
       expect(result).toBe(true);
     });
 
@@ -8997,7 +9133,7 @@ describe('SessionService', () => {
       await service.sendSeen('sess-uuid-1', '123@c.us', ['M1', 'M2']);
 
       // A one to one receipt needs no sender, so the rows are not read.
-      expect(mockEngine.sendSeen).toHaveBeenCalledWith('123@c.us', ['M1', 'M2'], undefined);
+      expect(mockEngine.sendSeen).toHaveBeenCalledWith('123@c.us', ['M1', 'M2'], undefined, expect.any(Function));
       expect(messageRepository.find).not.toHaveBeenCalled();
     });
 
@@ -9042,7 +9178,7 @@ describe('SessionService', () => {
         await service.sendSeen('sess-uuid-1', GROUP);
 
         expect(messageRepository.find).not.toHaveBeenCalled();
-        expect(mockEngine.sendSeen).toHaveBeenCalledWith(GROUP, undefined, undefined);
+        expect(mockEngine.sendSeen).toHaveBeenCalledWith(GROUP, undefined, undefined, expect.any(Function));
       });
 
       it('still reads the chat when the rows cannot be read', async () => {
@@ -9051,7 +9187,7 @@ describe('SessionService', () => {
 
         await expect(service.sendSeen('sess-uuid-1', GROUP, ['M1'])).resolves.toBe(true);
 
-        expect(mockEngine.sendSeen).toHaveBeenCalledWith(GROUP, ['M1'], undefined);
+        expect(mockEngine.sendSeen).toHaveBeenCalledWith(GROUP, ['M1'], undefined, expect.any(Function));
       });
     });
 
@@ -9076,7 +9212,7 @@ describe('SessionService', () => {
 
       const result = await service.markUnread('sess-uuid-1', '123@c.us');
 
-      expect(mockEngine.markUnread).toHaveBeenCalledWith('123@c.us');
+      expect(mockEngine.markUnread).toHaveBeenCalledWith('123@c.us', expect.any(Function));
       expect(result).toBe(true);
     });
 
@@ -9116,7 +9252,7 @@ describe('SessionService', () => {
 
       const result = await service.deleteChat('sess-uuid-1', '1234567890-123@g.us');
 
-      expect(mockEngine.deleteChat).toHaveBeenCalledWith('1234567890-123@g.us');
+      expect(mockEngine.deleteChat).toHaveBeenCalledWith('1234567890-123@g.us', expect.any(Function));
       expect(result).toBe(true);
     });
 
@@ -9270,6 +9406,36 @@ describe('SessionService', () => {
       expect(deletedHooks()).toHaveLength(0);
     });
 
+    // #1891: the engine can key a write to the stored newest message, and still decline or fail.
+    it.each([
+      ['clearChatMessages', 'declines', (id: string, chat: string) => service.clearChatMessages(id, chat)],
+      ['deleteChat', 'fails', (id: string, chat: string) => service.deleteChat(id, chat)],
+    ] as const)(
+      '%s keeps the stored rows when the engine read the stored message and then %s',
+      async (method, outcome, run) => {
+        (messageRepository.findOne as jest.Mock).mockResolvedValueOnce({
+          waMessageId: 'S1',
+          chatId: '123@c.us',
+          direction: MessageDirection.INCOMING,
+          timestamp: 1690000000,
+        });
+        mockEngine[method].mockImplementationOnce(async (_chat: string, stored?: StoredChatMessageLookup) => {
+          await stored?.();
+          if (outcome === 'fails') throw new Error('timed out');
+          return false;
+        });
+
+        const call = run('sess-uuid-1', '123@c.us');
+        if (outcome === 'fails') await expect(call).rejects.toThrow('timed out');
+        else await expect(call).resolves.toBe(false);
+
+        expect(messageRepository.findOne).toHaveBeenCalled();
+        expect(messageRepository.find).not.toHaveBeenCalled();
+        expect(messageRepository.delete).not.toHaveBeenCalled();
+        expect(deletedHooks()).toHaveLength(0);
+      },
+    );
+
     it('a failed removal after the engine succeeded is logged and the call still succeeds', async () => {
       (messageRepository.find as jest.Mock).mockRejectedValueOnce(new Error('db down'));
       const logError = jest.spyOn((service as unknown as { logger: { error: jest.Mock } }).logger, 'error');
@@ -9281,6 +9447,239 @@ describe('SessionService', () => {
         'db down',
         expect.objectContaining({ action: 'chat_local_purge_failed' }),
       );
+    });
+  });
+
+  // ── the stored newest message a chat write falls back to (#1891) ──
+
+  describe('stored last message lookup', () => {
+    beforeEach(async () => {
+      (repository.findOne as jest.Mock).mockResolvedValue(createMockSession());
+      (repository.update as jest.Mock).mockResolvedValue({ affected: 1 });
+      await service.start('sess-uuid-1');
+    });
+
+    /** The lookup the service handed the engine for `run`, called once. */
+    const lookupOf = async (
+      method: 'markUnread' | 'clearChatMessages' | 'deleteChat' | 'sendSeen',
+      run: () => Promise<unknown>,
+    ): Promise<unknown> => {
+      mockEngine[method].mockResolvedValueOnce(false);
+      await run();
+      const calls = mockEngine[method].mock.calls as unknown[][];
+      const lookup = calls[calls.length - 1].find(arg => typeof arg === 'function') as StoredChatMessageLookup;
+      return lookup();
+    };
+    const whereOf = (): unknown =>
+      ((messageRepository.findOne as jest.Mock).mock.calls as [{ where: unknown }][])[0][0].where;
+
+    it("reads a 1:1 chat's newest stored message under every id form of it", async () => {
+      (lidMappingStore.findLidsForPhone as jest.Mock).mockResolvedValue(['999']);
+      (messageRepository.findOne as jest.Mock).mockResolvedValueOnce({
+        waMessageId: 'S1',
+        chatId: '123@c.us',
+        direction: MessageDirection.OUTGOING,
+        author: null,
+        timestamp: 1690000000,
+      });
+
+      // The chat's lid comes from the table-backed lookup, which the engine's cache can lack.
+      await expect(lookupOf('markUnread', () => service.markUnread('sess-uuid-1', '123@c.us'))).resolves.toEqual({
+        id: 'S1',
+        fromMe: true,
+        timestamp: 1690000000,
+        lid: '999@lid',
+      });
+      const base = {
+        sessionId: 'sess-uuid-1',
+        chatId: In(['123@c.us', '123@s.whatsapp.net', '999@lid']),
+        waMessageId: Not(IsNull()),
+        timestamp: Not(IsNull()),
+      };
+      expect(whereOf()).toEqual([base]);
+      expect(messageRepository.findOne).toHaveBeenCalledWith(
+        expect.objectContaining({ order: { timestamp: 'DESC', createdAt: 'DESC' } }),
+      );
+    });
+
+    it('in a group, takes an own message or a received one with its sender, and its lid from the table', async () => {
+      (lidMappingStore.findLidsForPhone as jest.Mock).mockImplementation((phone: string) =>
+        Promise.resolve(phone === '628222' ? ['555'] : []),
+      );
+      (messageRepository.findOne as jest.Mock).mockResolvedValueOnce({
+        waMessageId: 'G1',
+        chatId: '1234567890-123@g.us',
+        direction: MessageDirection.INCOMING,
+        author: '628222@c.us',
+        timestamp: 1690000001,
+      });
+
+      await expect(
+        lookupOf('clearChatMessages', () => service.clearChatMessages('sess-uuid-1', '1234567890-123@g.us')),
+      ).resolves.toEqual({
+        id: 'G1',
+        fromMe: false,
+        author: '628222@c.us',
+        authorLid: '555@lid',
+        timestamp: 1690000001,
+      });
+      expect(lidMappingStore.findLidsForPhone).toHaveBeenCalledWith('628222');
+      const base = {
+        sessionId: 'sess-uuid-1',
+        chatId: In(['1234567890-123@g.us']),
+        waMessageId: Not(IsNull()),
+        timestamp: Not(IsNull()),
+      };
+      expect(whereOf()).toEqual([
+        { ...base, direction: MessageDirection.INCOMING, author: Not(IsNull()) },
+        { ...base, direction: MessageDirection.OUTGOING },
+      ]);
+    });
+
+    it('takes the lid the row is filed under when the table maps the phone to two, and no row filed under the phone', async () => {
+      (lidMappingStore.findLidsForPhone as jest.Mock).mockResolvedValue(['998', '999']);
+      const row = (chatId: string) => ({
+        waMessageId: 'S1',
+        chatId,
+        direction: MessageDirection.INCOMING,
+        author: null,
+        timestamp: 1690000000,
+      });
+      (messageRepository.findOne as jest.Mock).mockResolvedValueOnce(row('999@lid'));
+      await expect(lookupOf('markUnread', () => service.markUnread('sess-uuid-1', '123@c.us'))).resolves.toEqual({
+        id: 'S1',
+        fromMe: false,
+        timestamp: 1690000000,
+        lid: '999@lid',
+      });
+
+      // Filed under the phone, the row names neither lid, and either would be a guess: no write is keyed to it.
+      (messageRepository.findOne as jest.Mock).mockResolvedValueOnce(row('123@c.us'));
+      await expect(lookupOf('markUnread', () => service.markUnread('sess-uuid-1', '123@c.us'))).resolves.toBeNull();
+    });
+
+    it('takes no group message whose sender the table maps to two lids, and keeps the cache to a sender with none', async () => {
+      (lidMappingStore.findLidsForPhone as jest.Mock).mockImplementation((phone: string) =>
+        Promise.resolve(phone === '628222' ? ['554', '555'] : []),
+      );
+      const row = (author: string) => ({
+        waMessageId: 'G1',
+        chatId: '1234567890-123@g.us',
+        direction: MessageDirection.INCOMING,
+        author,
+        timestamp: 1690000001,
+      });
+      (messageRepository.findOne as jest.Mock).mockResolvedValueOnce(row('628222@c.us'));
+      await expect(
+        lookupOf('clearChatMessages', () => service.clearChatMessages('sess-uuid-1', '1234567890-123@g.us')),
+      ).resolves.toBeNull();
+
+      // A sender the table maps to no lid keeps its row: the engine falls back to the lid it knows, if any.
+      (messageRepository.findOne as jest.Mock).mockResolvedValueOnce(row('628333@c.us'));
+      await expect(
+        lookupOf('clearChatMessages', () => service.clearChatMessages('sess-uuid-1', '1234567890-123@g.us')),
+      ).resolves.toEqual({ id: 'G1', fromMe: false, author: '628333@c.us', timestamp: 1690000001 });
+    });
+
+    it('for a read receipt, takes only a received message', async () => {
+      await expect(lookupOf('sendSeen', () => service.sendSeen('sess-uuid-1', '123@c.us'))).resolves.toBeNull();
+      expect(whereOf()).toEqual([expect.objectContaining({ direction: MessageDirection.INCOMING })]);
+    });
+
+    // The query itself, on a real database: the id-form `In`, the group sender rule and the ordering.
+    describe('against a real database', () => {
+      let db: DataSource;
+      let messages: Repository<Message>;
+
+      beforeAll(async () => {
+        db = new DataSource({ type: 'better-sqlite3', database: ':memory:', entities: [Message], synchronize: true });
+        await db.initialize();
+        messages = db.getRepository(Message);
+        const row = (
+          chatId: string,
+          waMessageId: string | null,
+          direction: MessageDirection,
+          timestamp: number,
+          author?: string,
+        ) => ({ sessionId: 'sess-uuid-1', chatId, waMessageId, direction, timestamp, author, from: 'a', to: 'b' });
+        await messages.insert([
+          row('123@c.us', 'OUT', MessageDirection.OUTGOING, 100),
+          row('999@lid', 'IN', MessageDirection.INCOMING, 200),
+          row('123@c.us', null, MessageDirection.INCOMING, 300),
+          row('777@c.us', 'OTHER', MessageDirection.INCOMING, 400),
+          row('1-2@g.us', 'G-ANON', MessageDirection.INCOMING, 500),
+          row('1-2@g.us', 'G-OWN', MessageDirection.OUTGOING, 300),
+          row('1-2@g.us', 'G-IN', MessageDirection.INCOMING, 250, '628222@c.us'),
+          row('456@c.us', 'TWO-OLD', MessageDirection.OUTGOING, 100),
+          row('462@lid', 'TWO-NEW', MessageDirection.INCOMING, 200),
+          row('461@lid', 'TWO-OLDER', MessageDirection.INCOMING, 50),
+          row('782@lid', 'PHONE-OLD', MessageDirection.INCOMING, 100),
+          row('789@c.us', 'PHONE-NEW', MessageDirection.OUTGOING, 200),
+          row('3-4@g.us', 'AMBIGUOUS-OWN', MessageDirection.OUTGOING, 100),
+          row('3-4@g.us', 'AMBIGUOUS-IN', MessageDirection.INCOMING, 200, '628333@c.us'),
+        ] as QueryDeepPartialEntity<Message>[]);
+      });
+
+      afterAll(async () => {
+        await db.destroy();
+      });
+
+      beforeEach(() => {
+        Object.assign(service as unknown as Record<string, unknown>, { messageRepository: messages });
+        const lids: Record<string, string[]> = {
+          123: ['999'],
+          456: ['461', '462'],
+          789: ['781', '782'],
+          628333: ['5551', '5552'],
+        };
+        (lidMappingStore.findLidsForPhone as jest.Mock).mockImplementation((phone: string) =>
+          Promise.resolve(lids[phone] ?? []),
+        );
+      });
+
+      it("finds a 1:1 chat's newest message under its lid twin and skips rows without an id", async () => {
+        await expect(lookupOf('markUnread', () => service.markUnread('sess-uuid-1', '123@c.us'))).resolves.toEqual({
+          id: 'IN',
+          fromMe: false,
+          timestamp: 200,
+          lid: '999@lid',
+        });
+      });
+
+      it('takes the lid the newest row is filed under when the phone maps to two', async () => {
+        await expect(lookupOf('markUnread', () => service.markUnread('sess-uuid-1', '456@c.us'))).resolves.toEqual({
+          id: 'TWO-NEW',
+          fromMe: false,
+          timestamp: 200,
+          lid: '462@lid',
+        });
+      });
+
+      it('takes no message filed under a phone the table maps to two lids, nor one from a sender it maps to two', async () => {
+        await expect(lookupOf('markUnread', () => service.markUnread('sess-uuid-1', '789@c.us'))).resolves.toBeNull();
+        await expect(
+          lookupOf('clearChatMessages', () => service.clearChatMessages('sess-uuid-1', '3-4@g.us')),
+        ).resolves.toBeNull();
+        await expect(lookupOf('sendSeen', () => service.sendSeen('sess-uuid-1', '3-4@g.us'))).resolves.toBeNull();
+      });
+
+      it('in a group, skips a received message without its sender, and a receipt takes only a received one', async () => {
+        await expect(
+          lookupOf('clearChatMessages', () => service.clearChatMessages('sess-uuid-1', '1-2@g.us')),
+        ).resolves.toMatchObject({ id: 'G-OWN', fromMe: true, timestamp: 300 });
+        await expect(lookupOf('sendSeen', () => service.sendSeen('sess-uuid-1', '1-2@g.us'))).resolves.toMatchObject({
+          id: 'G-IN',
+          fromMe: false,
+          author: '628222@c.us',
+          timestamp: 250,
+        });
+      });
+    });
+
+    it('is not read until the engine asks for it', async () => {
+      mockEngine.deleteChat.mockResolvedValueOnce(false);
+      await service.deleteChat('sess-uuid-1', '123@c.us');
+      expect(messageRepository.findOne).not.toHaveBeenCalled();
     });
   });
 
@@ -10794,8 +11193,14 @@ describe('SessionService', () => {
     const autoStartRun = (): Promise<void> => (service as unknown as { autoStartRun: Promise<void> }).autoStartRun;
 
     const originalFlag = process.env.AUTO_START_SESSIONS;
+    // A sleep a case holds on node:timers/promises, the module object every test in the worker shares. It
+    // is released and restored here, so a case that fails or times out cannot leave it behind.
+    let heldSleep: { wake: () => void; spy: { mockRestore: () => void } } | undefined;
 
     afterEach(async () => {
+      heldSleep?.wake();
+      heldSleep?.spy.mockRestore();
+      heldSleep = undefined;
       if (originalFlag === undefined) delete process.env.AUTO_START_SESSIONS;
       else process.env.AUTO_START_SESSIONS = originalFlag;
       // Bootstrap always starts the (unref'd) liveness watchdog interval now — clear it so no
@@ -10845,6 +11250,40 @@ describe('SessionService', () => {
       } finally {
         jest.useRealTimers();
       }
+    });
+
+    it('waits the full throttle between two auto-started launches', async () => {
+      process.env.AUTO_START_SESSIONS = 'true';
+      (repository.find as jest.Mock).mockResolvedValue([
+        { id: 'a', name: 'A' },
+        { id: 'b', name: 'B' },
+      ]);
+      const startSpy = jest.spyOn(service, 'start').mockResolvedValue(undefined as never);
+      // The run sleeps through node:timers/promises, which fake timers do not reach, so its first sleep is held
+      // on the module object the service reads it from; any later one is the real sleep.
+      const timersPromises = jest.requireActual<{ setTimeout: (ms: number) => Promise<void> }>('node:timers/promises');
+      let wake: () => void = () => undefined;
+      const sleep = jest
+        .spyOn(timersPromises, 'setTimeout')
+        .mockImplementationOnce(() => new Promise<void>(resolve => (wake = resolve)));
+      heldSleep = { wake: () => wake(), spy: sleep };
+      const until = async (condition: () => boolean): Promise<void> => {
+        const deadline = Date.now() + 4_000;
+        while (!condition()) {
+          if (Date.now() > deadline) throw new Error('condition not reached');
+          await new Promise(resolve => setImmediate(resolve));
+        }
+      };
+
+      service.onApplicationBootstrap();
+      await until(() => sleep.mock.calls.length === 1);
+      expect(sleep).toHaveBeenCalledWith(AUTOSTART_THROTTLE_MS);
+      expect(startSpy).toHaveBeenCalledTimes(1);
+
+      wake();
+      await autoStartRun();
+      expect(startSpy).toHaveBeenCalledTimes(2);
+      expect(startSpy).toHaveBeenLastCalledWith('b');
     });
 
     it('keeps starting the remaining sessions when one fails', async () => {
@@ -11548,6 +11987,30 @@ describe('SessionService', () => {
         maxReconnectAttempts: 20,
         reconnectBaseDelay: 1000,
       });
+    });
+
+    // A row created before the create body validated config, or carried in by a data import, can hold a
+    // fractional delay. The response field is an integer to every client that decodes it.
+    it('reports a fractional legacy reconnectBaseDelay as an integer on GET', async () => {
+      (repository.findOne as jest.Mock).mockResolvedValue(
+        createMockSession({ config: { reconnectBaseDelay: 2500.5 } }),
+      );
+
+      const result = await service.getConfig('sess-uuid-1');
+
+      expect(result.reconnectBaseDelay).toBe(2500);
+    });
+
+    it('reports a fractional legacy reconnectBaseDelay as an integer after a PATCH of another key', async () => {
+      (repository.findOne as jest.Mock).mockResolvedValue(
+        createMockSession({ config: { reconnectBaseDelay: 2500.5 } }),
+      );
+
+      const result = await service.updateConfig('sess-uuid-1', { autoRejectCalls: true });
+
+      // The stored value is the operator's and stays as it is; only the reported one is resolved.
+      expect(writtenConfig()).toEqual({ reconnectBaseDelay: 2500.5, autoRejectCalls: true });
+      expect(result.reconnectBaseDelay).toBe(2500);
     });
   });
 

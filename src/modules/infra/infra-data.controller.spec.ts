@@ -1636,6 +1636,31 @@ describe('InfraDataController.import/export preserves every data-DB table', () =
     expect((await lidRepo.findOneByOrFail({ lid: '111' })).isReported).toBe(false);
   });
 
+  // The mark of a deleted chat outlives a restart because the stored messages it guards do, and a
+  // restore brings both back.
+  it('restores the deletion mark of a chat state, and reads an archive taken without one as none', async () => {
+    await seedSession('s1');
+    const repo = ds.getRepository(ChatState);
+    await repo.save([
+      repo.create({ sessionId: 's1', chatId: '628111@s.whatsapp.net', deletedAt: 1790000000000 }),
+      repo.create({ sessionId: 's1', chatId: '120363@g.us', pinned: true }),
+    ]);
+
+    const dump = await controller.exportData();
+    await repo.clear();
+    const res = await controller.importData({ tables: dump.tables });
+
+    expect(res.warnings).toEqual([]);
+    expect(await repo.findOneByOrFail({ chatId: '628111@s.whatsapp.net' })).toMatchObject({ deletedAt: 1790000000000 });
+    expect(await repo.findOneByOrFail({ chatId: '120363@g.us' })).toMatchObject({ pinned: true, deletedAt: null });
+
+    const states = (dump.tables as unknown as { chatStates: { deletedAt?: number | null }[] }).chatStates;
+    for (const state of states) delete state.deletedAt;
+    const legacy = await controller.importData({ tables: dump.tables });
+    expect(legacy.warnings).toEqual([]);
+    expect((await repo.findOneByOrFail({ chatId: '628111@s.whatsapp.net' })).deletedAt).toBeNull();
+  });
+
   // Restoring ONTO the instance that produced the archive is the rollback flow, and it is the one the
   // outbox broke. The table carries no FK to sessions, so the sessions DELETE never reached it, and
   // UNIQUE(webhookId, idempotencyKey) then collided on every row until the all-or-nothing gate rolled
@@ -2793,6 +2818,29 @@ describe('InfraDataController.importData status_updates + runtime reconciliation
     expect(res.stoppedOrphanEngines).toEqual([]);
     expect(res.orphanedEngines).toEqual([]);
     expect(await ds.getRepository(Session).count()).toBe(1);
+  });
+
+  // Committed, such a row made every entity read of it throw: GET /sessions answered 500 for every session, and the
+  // webhook lookup of each event read the session's webhooks as none.
+  it.each([
+    ['a session config', 'Skipped session s1: config is not valid JSON'],
+    ['webhook headers', 'Skipped webhook wh1: headers is not valid JSON'],
+  ])('refuses an archive whose %s does not parse, replacing nothing', async (_case, warning) => {
+    await seedSession('s1');
+    await ds.getRepository(Webhook).save({ id: 'wh0', sessionId: 's1', url: 'https://example.com/kept' });
+    const dump = await build().exportData();
+    const [session] = dump.tables.sessions as unknown as Record<string, unknown>[];
+    const webhook = { id: 'wh1', sessionId: 's1', url: 'https://example.com/hook', events: ['message.received'] };
+    const tables = warning.includes('session')
+      ? { ...dump.tables, sessions: [{ ...session, config: '{"maxReconnectAttempts": 3' }] }
+      : { ...dump.tables, webhooks: [{ ...webhook, headers: '{"Authorization": "Bearer x"' }] };
+
+    const res = await build().importData({ tables: tables as never });
+
+    expect(res.imported).toBe(false);
+    expect(res.warnings).toEqual([warning]);
+    expect(await ds.getRepository(Session).find()).toHaveLength(1);
+    expect((await ds.getRepository(Webhook).find()).map(w => w.id)).toEqual(['wh0']);
   });
 
   it('still reports the engines it already stopped when the import rolls back', async () => {

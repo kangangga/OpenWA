@@ -54,13 +54,18 @@ import { ListingMemo } from '../../common/utils/listing-memo';
 import { isTransientDbError, isUniqueViolation } from '../../common/utils/db-errors';
 import { awaitNoOpenTransaction } from '../../common/utils/shared-connection';
 import { resolveFeatureFlags } from '../../config/feature-flags';
-import { IWhatsAppEngine, ChatSummary, ChatState } from '../../engine/interfaces/whatsapp-engine.interface';
+import {
+  IWhatsAppEngine,
+  ChatSummary,
+  ChatState,
+  type StoredChatMessageLookup,
+} from '../../engine/interfaces/whatsapp-engine.interface';
 import { createLogger } from '../../common/services/logger.service';
 import { ShutdownService } from '../../common/services/shutdown.service';
 import { HookManager } from '../../core/hooks';
 import { LidMappingStoreService } from '../../engine/identity/lid-mapping-store.service';
 import { resolveJidCandidates } from '../../engine/identity/jid-candidates';
-import { chatKind } from '../../engine/identity/wa-id';
+import { chatKind, parseWaId } from '../../engine/identity/wa-id';
 import { Message, MessageDirection } from '../message/entities/message.entity';
 import { ServerShuttingDownException, SessionStoppedException } from './session-engine-controls';
 import { phoneKey } from './message-mutation-guard';
@@ -923,7 +928,7 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
         this.startReservations.delete(id);
         // No start of the session runs now to look at the stop requests that have returned.
         this.dropEndedStops(id);
-        if (this.releaseOwed.delete(id)) await this.releaseUnlessEngineActive(id);
+        if (this.releaseOwed.delete(id)) await this.releaseUnlessEngineActive(id, undefined, { correctStatus: true });
       }
     }
   }
@@ -937,30 +942,47 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
     const stopRequestsBefore = this.stopRequestSeq;
     // Claimed before the engine is launched, never after: launching first and discovering the
     // session belongs elsewhere would already have opened a second connection to the account.
-    if (this.ownership && !(await this.ownership.claim(id))) {
-      // The claim is a conditional UPDATE, so an id that does not exist also matches zero rows —
-      // surface the route's documented 404 for that case instead of a misleading 409.
-      await this.findOne(id);
-      throw new ConflictException(`Session ${id} is running on another node`);
-    }
+    if (this.ownership) await this.claimForStart(id, this.ownership);
     let session: Session;
     try {
       session = await this.startWithTransientRetry(id, explicit, stopRequestsBefore);
     } catch (error) {
       await this.keepDownIfStoppedDuringStart(id, explicit, stopRequestsBefore);
-      // A failed or refused start must not leave the claim pinned here — the heartbeat would renew
-      // it and the session could never be started anywhere else. Released only when nothing is
-      // actually alive locally: an "already starting/started" refusal means this node genuinely
-      // runs the engine, and releasing then would invite a peer to open a second connection.
-      await this.releaseUnlessEngineActive(id);
+      // A failed or refused start must not leave the claim here: until its lease lapsed, no other node
+      // could start the session. Released only when nothing is actually alive locally, and then with
+      // the status corrected: an "already starting/started" refusal means this node genuinely runs
+      // the engine, and releasing then would invite a peer to open a second connection.
+      await this.releaseUnlessEngineActive(id, undefined, { correctStatus: true });
       throw error;
     }
     await this.keepDownIfStoppedDuringStart(id, explicit, stopRequestsBefore);
     // A start retired by a concurrent stop() resolves normally but leaves no engine, and that stop
     // skipped its release while this start still held the session. Hand the claim back here, or the
     // row keeps naming this node until the lease lapses and a peer adopts the stopped session.
-    await this.releaseUnlessEngineActive(id);
+    await this.releaseUnlessEngineActive(id, undefined, { correctStatus: true });
     return session;
+  }
+
+  /**
+   * Claim the session for this node's start. The claim is a conditional UPDATE, so an id that does not exist also
+   * matches zero rows: that answers the route's documented 404 instead of a misleading 409. A claim that could not be
+   * written launched nothing, so it answers the retryable 503 a delete gives for the same failure, not a 500.
+   */
+  private async claimForStart(id: string, ownership: SessionOwnershipService): Promise<void> {
+    let claimed: boolean;
+    try {
+      claimed = await ownership.claim(id);
+    } catch (error) {
+      this.logger.warn(`Could not claim session ${id} for the start; nothing was started`, {
+        sessionId: id,
+        action: 'session_start_claim_failed',
+        error: error instanceof Error ? error.message : String(error),
+      });
+      throw new ServiceUnavailableException(`Session ${id} could not be claimed for the start; nothing was started`);
+    }
+    if (claimed) return;
+    await this.findOne(id);
+    throw new ConflictException(`Session ${id} is running on another node`);
   }
 
   /**
@@ -1007,10 +1029,7 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
         this.refuseIfShuttingDown();
         // The lease may have lapsed while the first attempt ran; the retry must keep holding the
         // claim, never 409 on the session it already owns.
-        if (this.ownership && !(await this.ownership.claim(id))) {
-          await this.findOne(id);
-          throw new ConflictException(`Session ${id} is running on another node`);
-        }
+        if (this.ownership) await this.claimForStart(id, this.ownership);
         // Checked again: a stop that landed during the re-claim leaves the claim for claimAndStart's catch to release.
         if (this.stoppedSince(id, stopRequestsBefore)) {
           throw new SessionStoppedException(`Session ${id} was stopped`);
@@ -1103,8 +1122,9 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
       // The 502-incomplete path tears the engine down, so its claim must not survive the call. A 400
       // "not started" refusal changed nothing and keeps whatever claim there is: release() also
       // clears a LAPSED foreign claim, which would take a crashed node's session out of takeover.
+      // Neither did a failure before an engine was found (the row read): only a request means one was.
       if (error instanceof BadRequestException) withdraw();
-      if (!(error instanceof BadRequestException)) await this.releaseAfterTeardown(id);
+      if (request && !(error instanceof BadRequestException)) await this.releaseAfterTeardown(id);
       throw error;
     } finally {
       if (request) this.endStop(id, request);
@@ -1133,10 +1153,10 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
       await this.releaseAfterTeardown(id);
       return session;
     } catch (error) {
-      // The 400 "not started" also keeps its claim as in logout(). The 502 did evict the engine: its
-      // request stands and it releases.
+      // The 400 "not started" and a failed row read also keep their claim as in logout(). The 502 did
+      // evict the engine: its request stands and it releases.
       if (error instanceof BadRequestException) withdraw();
-      if (!(error instanceof BadRequestException)) await this.releaseAfterTeardown(id);
+      if (request && !(error instanceof BadRequestException)) await this.releaseAfterTeardown(id);
       throw error;
     } finally {
       if (request) this.endStop(id, request);
@@ -1281,9 +1301,15 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
 
   /**
    * Hand the claim back unless something still runs here (engine, in-flight start, pending reconnect,
-   * delete in flight).
+   * delete in flight). A start's release (`correctStatus`) then corrects the status of the row it
+   * released: nothing runs it here, and a row no node holds is never revisited by the lapsed-claim
+   * correction or the takeover sweep, so a READY a vanished node left on it would stand until a boot.
    */
-  private async releaseUnlessEngineActive(id: string, ownsClaim?: () => boolean): Promise<void> {
+  private async releaseUnlessEngineActive(
+    id: string,
+    ownsClaim?: () => boolean,
+    { correctStatus = false } = {},
+  ): Promise<void> {
     if (!this.ownership || this.engineLifecycle.isEngineActive(id)) {
       return;
     }
@@ -1295,6 +1321,29 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
     }
     this.releaseOwed.delete(id);
     await this.releaseClaimBestEffort(id, ownsClaim);
+    if (correctStatus) await this.disconnectReleasedRow(id);
+  }
+
+  /**
+   * Written after the release and on an unclaimed row only: any claim sets `nodeId`, so a row a peer or
+   * a later start has claimed since keeps the status its start gives it, and a release that failed
+   * leaves the row claimed, to lapse into the corrections that read claimed rows. Best-effort, like the
+   * release: the start's own outcome is the answer.
+   */
+  private async disconnectReleasedRow(id: string): Promise<void> {
+    try {
+      const { affected } = await this.sessionRepository.update(
+        { id, nodeId: IsNull(), status: In(ACTIVE_STATUSES) },
+        { status: SessionStatus.DISCONNECTED },
+      );
+      if (affected) this.engineLifecycle.announceStatus(id, SessionStatus.DISCONNECTED);
+    } catch (error) {
+      this.logger.warn(`Could not mark session ${id} disconnected after its start left no engine`, {
+        sessionId: id,
+        action: 'session_release_status_failed',
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
   }
 
   /**
@@ -1469,10 +1518,21 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
    */
   async getPresence(id: string, chatId: string): Promise<ChatPresence | null> {
     await this.findOne(id);
+    // A report is stored under the neutral id WhatsApp sent it from, which on Baileys is the contact's lid once
+    // the subscribe went to it, so the read covers every form of the chat (the GET messages filter's rules).
+    const candidates = await resolveJidCandidates(chatId, {
+      resolveLid: lid => this.lidMappingStore.findPhoneForLid(lid),
+      lidsForPhone: phone => this.lidMappingStore.findLidsForPhone(phone),
+    });
     // Presence belongs to a connection: with no engine registered (stopped, logged out, killed or
     // failed) whatever was last reported is no longer current.
     if (!this.engines.has(id)) return null;
-    return this.presence.get(id, chatId);
+    let latest: ChatPresence | null = null;
+    for (const candidate of candidates) {
+      const reported = this.presence.get(id, candidate);
+      if (reported && (!latest || reported.observedAt > latest.observedAt)) latest = reported;
+    }
+    return latest;
   }
 
   async sendSeen(id: string, chatId: string, messageIds?: string[]): Promise<boolean> {
@@ -1480,7 +1540,9 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
     const engine = this.requireEngine(id);
 
     const authors = await this.groupAuthors(id, chatId, messageIds);
-    return engine.sendSeen(chatId, messageIds, authors).finally(() => this.chatListings.drop(id));
+    return engine
+      .sendSeen(chatId, messageIds, authors, this.storedLastMessage(id, chatId, { receivedOnly: true }))
+      .finally(() => this.chatListings.drop(id));
   }
 
   /**
@@ -1514,34 +1576,109 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
     await this.findOne(id); // Verify session exists
     const engine = this.requireEngine(id);
 
-    return engine.markUnread(chatId).finally(() => this.chatListings.drop(id));
+    return engine.markUnread(chatId, this.storedLastMessage(id, chatId)).finally(() => this.chatListings.drop(id));
+  }
+
+  /**
+   * The newest message the gateway stored for a chat, for an engine that keys chat writes to one and
+   * holds none for the chat itself (Baileys after a restart, #1891). The lookup runs only when the
+   * engine calls it, and covers every id form of the chat (the GET messages filter's rules).
+   *
+   * A received group message counts only with its sender, which the key needs; `receivedOnly` asks
+   * for the newest received message, the one a read receipt acknowledges.
+   */
+  private storedLastMessage(
+    sessionId: string,
+    chatId: string,
+    { receivedOnly = false }: { receivedOnly?: boolean } = {},
+  ): StoredChatMessageLookup {
+    return async () => {
+      const expanded = await resolveJidCandidates(chatId, {
+        resolveLid: lid => this.lidMappingStore.findPhoneForLid(lid),
+        lidsForPhone: phone => this.lidMappingStore.findLidsForPhone(phone),
+      });
+      const base = {
+        sessionId,
+        chatId: In([...new Set([chatId, ...expanded])]),
+        waMessageId: Not(IsNull()),
+        timestamp: Not(IsNull()),
+      };
+      const received = { ...base, direction: MessageDirection.INCOMING };
+      const where: FindOptionsWhere<Message>[] =
+        parseWaId(chatId).kind === 'group'
+          ? [
+              { ...received, author: Not(IsNull()) },
+              ...(receivedOnly ? [] : [{ ...base, direction: MessageDirection.OUTGOING }]),
+            ]
+          : [receivedOnly ? received : base];
+      const row = await this.messageRepository.findOne({
+        where,
+        order: { timestamp: 'DESC', createdAt: 'DESC' },
+        select: { id: true, waMessageId: true, chatId: true, direction: true, author: true, timestamp: true },
+      });
+      if (!row) return null;
+      // The lid the engine keys a lid-migrated chat by, read from the persisted mapping: the engine's
+      // own cache can lack it (#1901). A phone can map to more than one lid, so the lid the row is
+      // filed under wins, and a row filed under the phone takes the table's lid when it lists one. With
+      // two or more, for the chat or for the sender of a received group message, any one is a guess
+      // (the engine's cache would pick the oldest), so no write is keyed to the row at all.
+      const filed = parseWaId(row.chatId);
+      const lids = expanded.filter(candidate => parseWaId(candidate).kind === 'lid');
+      if (filed.kind !== 'lid' && lids.length > 1) return null;
+      const lid = filed.kind === 'lid' ? `${filed.userPart}@lid` : lids[0];
+      const sender =
+        parseWaId(chatId).kind === 'group' && row.direction === MessageDirection.INCOMING ? row.author : undefined;
+      const authorLids = sender ? await this.persistedLidsOf(sender) : [];
+      if (authorLids.length > 1) return null;
+      const authorLid = authorLids[0];
+      return {
+        id: row.waMessageId,
+        fromMe: row.direction === MessageDirection.OUTGOING,
+        ...(row.author ? { author: row.author } : {}),
+        timestamp: row.timestamp,
+        ...(lid ? { lid } : {}),
+        ...(authorLid ? { authorLid } : {}),
+      };
+    };
+  }
+
+  /** Every `<lid>@lid` the persisted mapping holds for a person (the lid itself for a lid). */
+  private async persistedLidsOf(jid: string): Promise<string[]> {
+    const parsed = parseWaId(jid);
+    if (parsed.kind === 'lid') return [`${parsed.userPart}@lid`];
+    if (parsed.kind !== 'user') return [];
+    return (await this.lidMappingStore.findLidsForPhone(parsed.userPart)).map(lid => `${lid}@lid`);
   }
 
   /**
    * Delete every message in a chat, keeping the chat itself. Resolves false when the engine could
-   * not act — an unknown chat, or on Baileys a chat with no known history to key the change to.
-   * On success the gateway's stored copies of the chat's messages are removed too.
+   * not act — an unknown chat, or on Baileys a chat with no message in memory or stored to key the
+   * change to. On success the gateway's stored copies of the chat's messages are removed too.
    */
   async clearChatMessages(id: string, chatId: string): Promise<boolean> {
     await this.findOne(id); // Verify session exists
     const engine = this.requireEngine(id);
 
     const cutoff = new Date();
-    const ok = await engine.clearChatMessages(chatId).finally(() => this.chatListings.drop(id));
+    const ok = await engine
+      .clearChatMessages(chatId, this.storedLastMessage(id, chatId))
+      .finally(() => this.chatListings.drop(id));
     if (ok) await this.purgeStoredChat(id, chatId, cutoff);
     return ok;
   }
 
   /**
-   * Archive or unarchive a chat. Resolves false when the engine could not act — on Baileys a chat
-   * with no known history has no last message to key the app-state modification to. That is a
-   * defined outcome, not an error, so it is reported as `success: false` rather than a 500.
+   * Archive or unarchive a chat. Resolves false when the engine could not act. Baileys keys the
+   * change to the chat's newest message in memory, else the newest stored one, else sends it
+   * without one for a chat the session knows, which WhatsApp applies too.
    */
   async archiveChat(id: string, chatId: string, archive: boolean): Promise<boolean> {
     await this.findOne(id); // Verify session exists
     const engine = this.requireEngine(id);
 
-    return engine.archiveChat(chatId, archive).finally(() => this.chatListings.drop(id));
+    return engine
+      .archiveChat(chatId, archive, this.storedLastMessage(id, chatId))
+      .finally(() => this.chatListings.drop(id));
   }
 
   /**
@@ -1573,7 +1710,9 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
     const engine = this.requireEngine(id);
 
     const cutoff = new Date();
-    const ok = await engine.deleteChat(chatId).finally(() => this.chatListings.drop(id));
+    const ok = await engine
+      .deleteChat(chatId, this.storedLastMessage(id, chatId))
+      .finally(() => this.chatListings.drop(id));
     if (ok) await this.purgeStoredChat(id, chatId, cutoff);
     return ok;
   }

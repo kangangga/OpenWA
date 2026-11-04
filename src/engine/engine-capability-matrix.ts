@@ -111,7 +111,7 @@ export const CURATED_CAPABILITY_EXCEPTIONS: Record<string, MethodCapability> = {
     wwjs: { status: 'supported' },
     baileys: { status: 'supported' },
     evidence:
-      "wwjs Client.archiveChat(chatId)/unarchiveChat(chatId) → Promise<boolean> (index.d.ts:46,328) — the CLIENT methods, not Chat.archive(), which resolves void; baileys chatModify({archive,lastMessages}, jid) (Types/Chat.d.ts:63-66) needs the chat's last message, so a chat with no known history resolves false rather than throwing",
+      "wwjs Client.archiveChat(chatId)/unarchiveChat(chatId) → Promise<boolean> (index.d.ts:46,328) — the CLIENT methods, not Chat.archive(), which resolves void; baileys chatModify({archive,lastMessages}, jid) (Types/Chat.d.ts:63-66) keyed to the chat's last message in memory, else the newest stored one, else sent with an empty range for a chat the session knows, which WhatsApp applies as well; an unknown id resolves false",
   },
   getBlockedContacts: {
     wwjs: { status: 'supported' },
@@ -123,7 +123,7 @@ export const CURATED_CAPABILITY_EXCEPTIONS: Record<string, MethodCapability> = {
     wwjs: { status: 'supported' },
     baileys: { status: 'supported' },
     evidence:
-      'wwjs Chat.clearMessages() → boolean (index.d.ts:1896); the injected sendClearChat returns false for an unknown chat (Injected/Utils.js:1220); baileys chatModify({clear:true,lastMessages}, jid) (Types/Chat.d.ts:75-78) — same last-message requirement as archiveChat, so a chat with no known history resolves false',
+      "wwjs Chat.clearMessages() → boolean (index.d.ts:1896); the injected sendClearChat returns false for an unknown chat (Injected/Utils.js:1220); baileys chatModify({clear:true,lastMessages}, jid) (Types/Chat.d.ts:75-78) — keyed to the chat's last message in memory or stored, so a chat with neither resolves false",
   },
   createGroup: {
     wwjs: { status: 'not-available', rootCause: 'library-limitation' },
@@ -231,6 +231,12 @@ export const CURATED_CAPABILITY_EXCEPTIONS: Record<string, MethodCapability> = {
     baileys: { status: 'not-available', rootCause: 'library-limitation' },
     evidence:
       'baileys no getReactions/fetchReactions; reactions exist only as event-augmented WAMessage.reactions (proto.IReaction @WAProto/index.d.ts:10623) via messages.reaction event; adapter does not persist them into its store; wwjs Message.getReactions (Message.js)',
+  },
+  getMessageReceipts: {
+    wwjs: { status: 'supported' },
+    baileys: { status: 'not-available', rootCause: 'library-limitation' },
+    evidence:
+      'baileys no getReceipts/fetchReceipts on socket or store; receipts arrive only via message-receipt.update event; wwjs Client.getMessageById (Client.js:1814) resolves any message the page holds, then Message.getInfo (Message.js:760), which answers null for a received message',
   },
   getProduct: {
     wwjs: { status: 'not-available', rootCause: 'library-limitation' },
@@ -359,6 +365,12 @@ export const CURATED_CAPABILITY_EXCEPTIONS: Record<string, MethodCapability> = {
     baileys: { status: 'supported' },
     evidence:
       'wwjs 1.34.7 exposes NO ephemeral setter — 0 hits for ephemeral in index.d.ts; only a create-time messageTimer option (Client.js:2328); adapter throws EngineNotSupportedError; baileys groupToggleEphemeral(jid, ephemeralExpiration) (Socket/groups.d.ts:40)',
+  },
+  setGroupMemberLabel: {
+    wwjs: { status: 'not-available', rootCause: 'library-limitation' },
+    baileys: { status: 'supported' },
+    evidence:
+      'wwjs 1.34.7 exposes NO member-label setter: 0 hits for memberLabel or member tag in index.d.ts and src/; adapter throws EngineNotSupportedError; baileys updateMemberLabel(jid, memberLabel) (Socket/messages-send.d.ts:34) relays a GROUP_MEMBER_LABEL_CHANGE protocol message to the group with the label cut by slice(0, 30) (messages-send.js:274-295)',
   },
   setGroupInfoAdminsOnly: {
     wwjs: { status: 'supported' },

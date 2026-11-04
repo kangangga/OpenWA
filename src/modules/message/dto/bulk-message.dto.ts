@@ -15,13 +15,16 @@ import {
   ArrayMaxSize,
   ValidatorConstraint,
   ValidatorConstraintInterface,
+  Matches,
 } from 'class-validator';
 import { Type } from 'class-transformer';
 import { Validate } from 'class-validator';
-import { ToStrictArray, ToStrictBoolean, ToStrictString } from '../../../common/utils/strict-boolean';
+import { ToStrictArray, ToStrictBoolean, ToStrictNumber, ToStrictString } from '../../../common/utils/strict-boolean';
 import {
   BATCH_ID_MAX_LENGTH,
   CHAT_ID_MAX_LENGTH,
+  CHAT_JID_MESSAGE,
+  CHAT_JID_PATTERN,
   MENTIONS_DESCRIPTION,
   MENTIONS_MAX,
   MENTION_WID_MAX_LENGTH,
@@ -150,6 +153,7 @@ class BulkMessageItemDto {
   @IsString()
   @IsNotEmpty()
   @MaxLength(CHAT_ID_MAX_LENGTH)
+  @Matches(CHAT_JID_PATTERN, { message: CHAT_JID_MESSAGE })
   chatId!: string;
 
   @ApiProperty({ description: 'Message type', enum: ['text', 'image', 'video', 'audio', 'document'] })
@@ -175,6 +179,7 @@ class BulkMessageOptionsDto {
     minimum: 1000,
     maximum: 60000,
   })
+  @ToStrictNumber()
   @IsOptional()
   @IsNumber()
   @Min(1000)
@@ -217,6 +222,8 @@ export class SendBulkMessageDto {
   @ToStrictArray()
   @IsArray()
   @ArrayMaxSize(BULK_MESSAGES_MAX)
+  // @ValidateNested accepts an entry that is itself an array, and its inner items escape both the cap and the checks.
+  @IsObject({ each: true })
   @ValidateNested({ each: true })
   @Type(() => BulkMessageItemDto)
   messages!: BulkMessageItemDto[];
